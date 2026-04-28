@@ -1,7 +1,7 @@
 ##  Live Demo
 
 https://elhadidy-job-tracker.streamlit.app
-
+![JobTracker Dashboard Preview](assets/dashboard-preview.png)
 ## Features
 
 - Interactive Streamlit dashboard for job application tracking
