@@ -1,20 +1,18 @@
 import os
 import re
+import base64
+import zipfile
+from io import BytesIO
 from datetime import date
+
+os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
-
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-
-try:
-    from sentence_transformers import SentenceTransformer
-    SENTENCE_TRANSFORMERS_AVAILABLE = True
-except Exception:
-    SENTENCE_TRANSFORMERS_AVAILABLE = False
 
 try:
     import pdfplumber
@@ -30,16 +28,19 @@ except Exception:
 # =========================================================
 # CONFIG
 # =========================================================
-DATA_PATH = "data/applications.csv"
-DOCUMENTS_PATH = "data/documents.csv"
-NOTES_PATH = "data/notes.csv"
-
 st.set_page_config(
     page_title="JobTracker Dashboard",
     page_icon="💼",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+DATA_DIR = "data"
+UPLOAD_DIR = os.path.join(DATA_DIR, "documents_uploads")
+
+DATA_PATH = os.path.join(DATA_DIR, "applications.csv")
+DOCUMENTS_PATH = os.path.join(DATA_DIR, "documents.csv")
+NOTES_PATH = os.path.join(DATA_DIR, "notes.csv")
 
 STATUS_OPTIONS = [
     "Applied",
@@ -54,11 +55,11 @@ SOURCE_OPTIONS = [
     "LinkedIn",
     "Company Website",
     "Referral",
-    "Indeed",
     "StepStone",
-    "Glassdoor",
-    "Email",
+    "Indeed",
     "Other",
+    "Email",
+    "Glassdoor",
 ]
 
 DOCUMENT_TYPES = [
@@ -68,10 +69,11 @@ DOCUMENT_TYPES = [
     "Certificate",
     "Transcript",
     "Portfolio",
+    "Job Description",
     "Other",
 ]
 
-DEFAULT_COLUMNS = [
+APP_COLUMNS = [
     "Company",
     "Role",
     "Date Applied",
@@ -81,16 +83,19 @@ DEFAULT_COLUMNS = [
     "Next Step",
 ]
 
-DOCUMENT_COLUMNS = [
+DOC_COLUMNS = [
     "Document Name",
     "Type",
+    "Linked Application",
     "Company",
     "Role",
     "Date Added",
+    "File Name",
+    "File Path",
     "Notes",
 ]
 
-NOTES_COLUMNS = [
+NOTE_COLUMNS = [
     "Title",
     "Company",
     "Date Added",
@@ -98,24 +103,13 @@ NOTES_COLUMNS = [
 ]
 
 STATUS_COLORS = {
-    "Applied": "#2563EB",
-    "Screening": "#60A5FA",
-    "Phone Screen": "#38BDF8",
-    "Interview": "#8B5CF6",
-    "Offer": "#10B981",
-    "Rejected": "#F43F5E",
+    "Applied": "#3367D6",
+    "Screening": "#5F98E5",
+    "Phone Screen": "#3FA9F5",
+    "Interview": "#8A5CF6",
+    "Offer": "#31C48D",
+    "Rejected": "#F1416C",
 }
-
-SOURCE_COLORS = [
-    "#2563EB",
-    "#14B8A6",
-    "#8B5CF6",
-    "#FB923C",
-    "#CBD5E1",
-    "#F43F5E",
-    "#22C55E",
-    "#64748B",
-]
 
 COMMON_SKILLS = [
     "python", "sql", "excel", "power bi", "tableau", "r", "pandas", "numpy",
@@ -125,48 +119,177 @@ COMMON_SKILLS = [
     "cloud", "aws", "azure", "gcp", "docker", "git", "github",
     "nlp", "tensorflow", "pytorch", "streamlit", "plotly", "matplotlib",
     "database", "databases", "postgresql", "mysql", "snowflake", "api",
-    "a/b testing", "regression", "classification", "clustering",
-    "time series", "data cleaning", "data modeling", "kpi", "kpis",
-    "communication", "stakeholder", "presentation", "analytics",
+    "regression", "classification", "clustering", "time series",
+    "data cleaning", "data modeling", "kpi", "kpis", "analytics",
     "forecasting", "optimization", "requirements", "documentation",
     "agile", "scrum", "english", "german",
-
-    "datenanalyse", "datenvisualisierung", "berichterstattung",
-    "berichtswesen", "dashboard", "dashboards", "kennzahlen",
-    "datenmodellierung", "datenbereinigung", "datenbank",
-    "datenbanken", "maschinelles lernen", "künstliche intelligenz",
-    "statistik", "optimierung", "prognose", "zeitreihen",
-    "klassifikation", "regression", "clustering",
-    "praktikum", "werkstudent", "werkstudentin", "trainee",
-    "vollzeit", "teilzeit", "homeoffice", "remote", "hybrid",
+    "deutsch", "englisch", "datenanalyse", "datenvisualisierung",
+    "statistik", "praktikum", "werkstudent", "werkstudentin",
+    "trainee", "vollzeit", "teilzeit", "remote", "hybrid",
     "berufserfahrung", "kommunikation", "präsentation",
-    "anforderungen", "dokumentation", "agil", "deutsch", "englisch",
 ]
 
 
 # =========================================================
-# DATA SETUP
+# STYLE
 # =========================================================
-def ensure_data_files():
-    os.makedirs("data", exist_ok=True)
+st.markdown(
+    """
+<style>
+.block-container {
+    padding-top: 1rem;
+    padding-left: 1.2rem;
+    padding-right: 1.2rem;
+    padding-bottom: 1rem;
+    max-width: 100%;
+}
+
+[data-testid="stSidebar"] {
+    background-color: #F7F8FA;
+    border-right: 1px solid #E5E7EB;
+}
+
+h1 {
+    color: #0F172A !important;
+    font-size: 34px !important;
+    font-weight: 850 !important;
+    line-height: 1.2 !important;
+}
+
+h2, h3 {
+    color: #0F172A !important;
+    font-weight: 800 !important;
+}
+
+.stButton button {
+    border-radius: 12px;
+    font-weight: 700;
+}
+
+div[data-testid="stDataFrame"] {
+    border-radius: 14px;
+    overflow: hidden;
+    border: 1px solid #E5E7EB;
+}
+
+.kpi-card {
+    background: white;
+    border: 1px solid #E5E7EB;
+    border-radius: 18px;
+    padding: 16px 16px 14px 16px;
+    min-height: 125px;
+    box-shadow: 0 2px 10px rgba(15, 23, 42, 0.04);
+}
+
+.kpi-top {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+}
+
+.kpi-icon {
+    width: 48px;
+    height: 48px;
+    border-radius: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 24px;
+    flex-shrink: 0;
+}
+
+.kpi-title {
+    color: #475569;
+    font-size: 14px;
+    font-weight: 700;
+    margin-bottom: 6px;
+}
+
+.kpi-value {
+    color: #0F172A;
+    font-size: 26px;
+    font-weight: 850;
+    line-height: 1;
+    margin-bottom: 10px;
+}
+
+.kpi-sub {
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.small-info-card {
+    background: white;
+    border: 1px solid #E5E7EB;
+    border-radius: 16px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+}
+
+.small-info-title {
+    font-size: 14px;
+    font-weight: 800;
+    color: #111827;
+}
+
+.small-info-sub {
+    font-size: 13px;
+    color: #64748B;
+    margin-top: 4px;
+}
+
+.small-info-num {
+    float: right;
+    font-size: 22px;
+    font-weight: 850;
+    color: #8B5CF6;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# =========================================================
+# GENERAL HELPERS
+# =========================================================
+def stretch():
+    return {"width": "stretch"}
+
+
+def safe_filename(name):
+    name = os.path.basename(str(name))
+    name = re.sub(r"[^a-zA-Z0-9_. \-]", "_", name)
+    return name.strip().replace(" ", "_")
+
+
+def file_ext(path):
+    return os.path.splitext(str(path).lower())[1]
+
+
+def ensure_files():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
 
     if not os.path.exists(DATA_PATH):
-        sample_data = [
-            ["Microsoft", "Product Manager", "2024-05-20", "Interview", "LinkedIn", "Graz", "Interview - May 28, 2024"],
-            ["Shopify", "Senior Product Manager", "2024-05-18", "Screening", "Company Website", "Remote", "Recruiter Follow-up"],
-            ["Google", "Program Manager", "2024-05-15", "Interview", "Referral", "Vienna", "Onsite - Jun 3, 2024"],
-            ["Notion", "Product Operations Manager", "2024-05-10", "Applied", "Indeed", "Remote", "—"],
-            ["Airbnb", "Product Manager", "2024-05-08", "Screening", "LinkedIn", "Berlin", "Take-home Assignment"],
-            ["Amazon", "Business Analyst", "2024-05-06", "Rejected", "LinkedIn", "Munich", "—"],
-            ["Siemens", "Data Analyst", "2024-05-04", "Applied", "Company Website", "Graz", "Awaiting response"],
-        ]
-        pd.DataFrame(sample_data, columns=DEFAULT_COLUMNS).to_csv(DATA_PATH, index=False)
+        sample = pd.DataFrame(
+            [
+                ["Erste Group", "Machine Learning Intern", "2026-04-28", "Rejected", "LinkedIn", "Salzburg", "Archive application"],
+                ["Infineon", "Product Data Analyst", "2026-04-25", "Screening", "Indeed", "Salzburg", "Send availability"],
+                ["Magna", "Analytics Trainee", "2026-04-25", "Offer", "Company Website", "Graz", "Compare with other application"],
+                ["Erste Group", "Business Intelligence Analyst", "2026-04-24", "Rejected", "Company Website", "Graz", "No action needed"],
+                ["ams OSRAM", "Business Intelligence Analyst", "2026-04-20", "Interview", "LinkedIn", "Premstätten", "Upcoming interview"],
+                ["AVL", "Data Analyst Working Student", "2026-04-18", "Phone Screen", "Referral", "Graz", "Prepare for recruiter call"],
+            ],
+            columns=APP_COLUMNS,
+        )
+        sample.to_csv(DATA_PATH, index=False)
 
     if not os.path.exists(DOCUMENTS_PATH):
-        pd.DataFrame(columns=DOCUMENT_COLUMNS).to_csv(DOCUMENTS_PATH, index=False)
+        pd.DataFrame(columns=DOC_COLUMNS).to_csv(DOCUMENTS_PATH, index=False)
 
     if not os.path.exists(NOTES_PATH):
-        pd.DataFrame(columns=NOTES_COLUMNS).to_csv(NOTES_PATH, index=False)
+        pd.DataFrame(columns=NOTE_COLUMNS).to_csv(NOTES_PATH, index=False)
 
 
 def normalize_status(value):
@@ -174,7 +297,6 @@ def normalize_status(value):
         return "Applied"
 
     raw = str(value).strip().lower()
-
     mapping = {
         "applied": "Applied",
         "sent": "Applied",
@@ -183,33 +305,19 @@ def normalize_status(value):
         "pending": "Applied",
         "screening": "Screening",
         "screen": "Screening",
-        "hr screen": "Phone Screen",
         "phone screen": "Phone Screen",
         "phone": "Phone Screen",
         "call": "Phone Screen",
         "interview": "Interview",
         "interviewing": "Interview",
-        "technical interview": "Interview",
-        "onsite": "Interview",
         "offer": "Offer",
         "accepted": "Offer",
         "rejected": "Rejected",
-        "rejection": "Rejected",
         "declined": "Rejected",
-        "not selected": "Rejected",
-        "beworben": "Applied",
-        "eingereicht": "Applied",
-        "wartend": "Applied",
-        "in prüfung": "Screening",
-        "telefoninterview": "Phone Screen",
-        "telefonat": "Phone Screen",
-        "vorstellungsgespräch": "Interview",
-        "angebot": "Offer",
-        "zusage": "Offer",
-        "absage": "Rejected",
         "abgelehnt": "Rejected",
+        "absage": "Rejected",
+        "angebot": "Offer",
     }
-
     return mapping.get(raw, str(value).strip().title())
 
 
@@ -218,260 +326,223 @@ def normalize_source(value):
         return "Other"
 
     raw = str(value).strip().lower()
-
     mapping = {
         "linkedin": "LinkedIn",
-        "linked in": "LinkedIn",
         "company": "Company Website",
         "company website": "Company Website",
         "website": "Company Website",
         "career page": "Company Website",
-        "careers": "Company Website",
-        "karriereseite": "Company Website",
-        "unternehmenswebsite": "Company Website",
         "referral": "Referral",
-        "empfehlung": "Referral",
-        "indeed": "Indeed",
         "stepstone": "StepStone",
+        "indeed": "Indeed",
         "glassdoor": "Glassdoor",
+        "other": "Other",
         "email": "Email",
         "mail": "Email",
-        "e-mail": "Email",
     }
-
     return mapping.get(raw, str(value).strip().title())
 
 
-def clean_applications(data):
-    for col in DEFAULT_COLUMNS:
-        if col not in data.columns:
-            data[col] = ""
+def dataframe_to_csv_bytes(dataframe):
+    export_df = dataframe.copy()
 
-    data = data[DEFAULT_COLUMNS].copy()
+    if "Date Applied" in export_df.columns:
+        export_df["Date Applied"] = pd.to_datetime(
+            export_df["Date Applied"],
+            errors="coerce",
+        ).dt.strftime("%Y-%m-%d")
 
-    data["Company"] = data["Company"].fillna("").astype(str).str.strip().replace("", "Unknown Company")
-    data["Role"] = data["Role"].fillna("").astype(str).str.strip().replace("", "Unknown Role")
-    data["Location"] = data["Location"].fillna("").astype(str).str.strip().replace("", "—")
-    data["Next Step"] = data["Next Step"].fillna("").astype(str).str.strip().replace("", "Awaiting response")
+    if "Date Added" in export_df.columns:
+        export_df["Date Added"] = pd.to_datetime(
+            export_df["Date Added"],
+            errors="coerce",
+        ).dt.strftime("%Y-%m-%d")
 
-    data["Status"] = data["Status"].apply(normalize_status)
-    data["Source"] = data["Source"].apply(normalize_source)
-
-    data["Date Applied"] = pd.to_datetime(data["Date Applied"], errors="coerce")
-    data["Date Applied"] = data["Date Applied"].fillna(pd.Timestamp(date.today()))
-    data["Month"] = data["Date Applied"].dt.strftime("%b %Y")
-
-    return data
+    return export_df.to_csv(index=False).encode("utf-8")
 
 
-def load_applications():
-    ensure_data_files()
-    data = pd.read_csv(DATA_PATH)
-    return clean_applications(data)
+# =========================================================
+# LOAD / SAVE
+# =========================================================
+def load_apps():
+    ensure_files()
+    df = pd.read_csv(DATA_PATH)
+
+    for col in APP_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = df[APP_COLUMNS].copy()
+    df["Company"] = df["Company"].fillna("").astype(str).str.strip().replace("", "Unknown Company")
+    df["Role"] = df["Role"].fillna("").astype(str).str.strip().replace("", "Unknown Role")
+    df["Location"] = df["Location"].fillna("").astype(str).str.strip().replace("", "—")
+    df["Next Step"] = df["Next Step"].fillna("").astype(str).str.strip().replace("", "Awaiting response")
+
+    df["Status"] = df["Status"].apply(normalize_status)
+    df["Source"] = df["Source"].apply(normalize_source)
+    df["Date Applied"] = pd.to_datetime(df["Date Applied"], errors="coerce")
+    df["Date Applied"] = df["Date Applied"].fillna(pd.Timestamp(date.today()))
+    df["Month"] = df["Date Applied"].dt.strftime("%b %Y")
+
+    return df
 
 
-def save_applications(data):
-    data = clean_applications(data)
-    data_to_save = data[DEFAULT_COLUMNS].copy()
-    data_to_save["Date Applied"] = pd.to_datetime(data_to_save["Date Applied"]).dt.strftime("%Y-%m-%d")
-    data_to_save.to_csv(DATA_PATH, index=False)
+def save_apps(df):
+    for col in APP_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = df[APP_COLUMNS].copy()
+    df["Date Applied"] = pd.to_datetime(df["Date Applied"], errors="coerce")
+    df["Date Applied"] = df["Date Applied"].fillna(pd.Timestamp(date.today()))
+    df["Date Applied"] = df["Date Applied"].dt.strftime("%Y-%m-%d")
+    df.to_csv(DATA_PATH, index=False)
 
 
-def load_documents():
-    ensure_data_files()
-    data = pd.read_csv(DOCUMENTS_PATH)
+def load_docs():
+    ensure_files()
+    df = pd.read_csv(DOCUMENTS_PATH)
 
-    for col in DOCUMENT_COLUMNS:
-        if col not in data.columns:
-            data[col] = ""
+    for col in DOC_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
 
-    data = data[DOCUMENT_COLUMNS]
-    data["Date Added"] = pd.to_datetime(data["Date Added"], errors="coerce")
-    return data
+    df = df[DOC_COLUMNS].copy()
+    df["Date Added"] = pd.to_datetime(df["Date Added"], errors="coerce")
+
+    return df
 
 
-def save_documents(data):
-    data_to_save = data[DOCUMENT_COLUMNS].copy()
-    data_to_save["Date Added"] = pd.to_datetime(data_to_save["Date Added"], errors="coerce").dt.strftime("%Y-%m-%d")
-    data_to_save.to_csv(DOCUMENTS_PATH, index=False)
+def save_docs(df):
+    for col in DOC_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = df[DOC_COLUMNS].copy()
+    df["Date Added"] = pd.to_datetime(df["Date Added"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df.to_csv(DOCUMENTS_PATH, index=False)
 
 
 def load_notes():
-    ensure_data_files()
-    data = pd.read_csv(NOTES_PATH)
+    ensure_files()
+    df = pd.read_csv(NOTES_PATH)
 
-    for col in NOTES_COLUMNS:
-        if col not in data.columns:
-            data[col] = ""
+    for col in NOTE_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
 
-    data = data[NOTES_COLUMNS]
-    data["Date Added"] = pd.to_datetime(data["Date Added"], errors="coerce")
-    return data
-
-
-def save_notes(data):
-    data_to_save = data[NOTES_COLUMNS].copy()
-    data_to_save["Date Added"] = pd.to_datetime(data_to_save["Date Added"], errors="coerce").dt.strftime("%Y-%m-%d")
-    data_to_save.to_csv(NOTES_PATH, index=False)
+    df = df[NOTE_COLUMNS].copy()
+    df["Date Added"] = pd.to_datetime(df["Date Added"], errors="coerce")
+    return df
 
 
-# =========================================================
-# CRUD
-# =========================================================
-def add_application(company, role, date_applied, status, source, location, next_step):
-    data = load_applications()
-    new_row = pd.DataFrame(
-        [[company, role, date_applied, status, source, location, next_step]],
-        columns=DEFAULT_COLUMNS,
-    )
-    data = pd.concat([data[DEFAULT_COLUMNS], new_row], ignore_index=True)
-    save_applications(data)
+def save_notes(df):
+    for col in NOTE_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
 
-
-def update_application(row_index, company, role, date_applied, status, source, location, next_step):
-    data = load_applications()
-    data.loc[row_index, "Company"] = company
-    data.loc[row_index, "Role"] = role
-    data.loc[row_index, "Date Applied"] = date_applied
-    data.loc[row_index, "Status"] = status
-    data.loc[row_index, "Source"] = source
-    data.loc[row_index, "Location"] = location
-    data.loc[row_index, "Next Step"] = next_step
-    save_applications(data)
-
-
-def delete_application(row_index):
-    data = load_applications()
-    data = data.drop(index=row_index).reset_index(drop=True)
-    save_applications(data)
+    df = df[NOTE_COLUMNS].copy()
+    df["Date Added"] = pd.to_datetime(df["Date Added"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df.to_csv(NOTES_PATH, index=False)
 
 
 # =========================================================
-# CSV IMPORT
+# FILE HELPERS
 # =========================================================
-def normalize_col_name(col):
-    return str(col).strip().lower().replace("_", " ").replace("-", " ")
+def save_uploaded_file(uploaded_file, doc_type, company, role):
+    if uploaded_file is None:
+        return "", ""
+
+    original_name = safe_filename(uploaded_file.name)
+
+    prefix = "_".join([
+        safe_filename(doc_type or "Document"),
+        safe_filename(company or "General"),
+        safe_filename(role or "General"),
+    ])
+
+    final_name = f"{date.today().strftime('%Y%m%d')}_{prefix}_{original_name}"
+    path = os.path.join(UPLOAD_DIR, final_name)
+
+    with open(path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+
+    return final_name, path
 
 
-def guess_column(uploaded_columns, target):
-    aliases = {
-        "Company": [
-            "company", "company name", "employer", "organisation", "organization",
-            "firm", "business", "unternehmen", "firma", "arbeitgeber",
-        ],
-        "Role": [
-            "role", "job title", "position", "title", "job", "vacancy",
-            "job role", "stelle", "berufsbezeichnung",
-        ],
-        "Date Applied": [
-            "date applied", "applied date", "application date", "date",
-            "applied on", "created", "created at", "submitted date",
-            "bewerbungsdatum", "datum", "eingereicht am",
-        ],
-        "Status": [
-            "status", "stage", "application status", "pipeline", "state",
-            "stand", "phase", "bewerbungsstatus",
-        ],
-        "Source": [
-            "source", "platform", "job board", "channel", "where", "origin",
-            "quelle", "plattform", "kanal",
-        ],
-        "Location": [
-            "location", "city", "country", "place", "job location",
-            "ort", "stadt", "land", "standort",
-        ],
-        "Next Step": [
-            "next step", "next action", "follow up", "follow-up", "notes",
-            "note", "action", "todo", "nächster schritt", "notiz",
-            "aktion", "bemerkung",
-        ],
-    }
-
-    normalized_lookup = {normalize_col_name(col): col for col in uploaded_columns}
-
-    for alias in aliases[target]:
-        if alias in normalized_lookup:
-            return normalized_lookup[alias]
-
-    for normalized, original in normalized_lookup.items():
-        for alias in aliases[target]:
-            if alias in normalized:
-                return original
-
-    return "None"
-
-
-def build_imported_applications(uploaded_df, mapping):
-    imported = pd.DataFrame()
-
-    for target_col in DEFAULT_COLUMNS:
-        selected_col = mapping.get(target_col, "None")
-
-        if selected_col != "None" and selected_col in uploaded_df.columns:
-            imported[target_col] = uploaded_df[selected_col]
-        else:
-            defaults = {
-                "Company": "Unknown Company",
-                "Role": "Unknown Role",
-                "Date Applied": date.today().strftime("%Y-%m-%d"),
-                "Status": "Applied",
-                "Source": "Other",
-                "Location": "—",
-                "Next Step": "Awaiting response",
-            }
-            imported[target_col] = defaults[target_col]
-
-    return clean_applications(imported)
-
-
-# =========================================================
-# LOCAL NLP / ML
-# =========================================================
-@st.cache_resource
-def load_embedding_model():
-    if not SENTENCE_TRANSFORMERS_AVAILABLE:
-        return None
-
-    return SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-
-
-def read_pdf_text(uploaded_file):
+def read_pdf_path(path):
     if pdfplumber is None:
         return ""
 
-    text_parts = []
+    parts = []
 
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                text_parts.append(text)
+    try:
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                txt = page.extract_text()
+                if txt:
+                    parts.append(txt)
+    except Exception:
+        return ""
 
-    return "\n".join(text_parts)
+    return "\n".join(parts)
 
 
-def read_docx_text(uploaded_file):
+def read_docx_path(path):
     if docx is None:
         return ""
 
-    document = docx.Document(uploaded_file)
-    return "\n".join([para.text for para in document.paragraphs])
+    try:
+        document = docx.Document(path)
+        return "\n".join([p.text for p in document.paragraphs])
+    except Exception:
+        return ""
+
+
+def read_txt_path(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def read_text_from_path(path):
+    ext = file_ext(path)
+
+    if ext == ".pdf":
+        return read_pdf_path(path)
+
+    if ext == ".docx":
+        return read_docx_path(path)
+
+    if ext == ".txt":
+        return read_txt_path(path)
+
+    return ""
 
 
 def read_uploaded_cv(uploaded_file):
     if uploaded_file is None:
         return ""
 
-    file_name = uploaded_file.name.lower()
+    lower = uploaded_file.name.lower()
 
     try:
-        if file_name.endswith(".pdf"):
-            return read_pdf_text(uploaded_file)
+        if lower.endswith(".pdf") and pdfplumber is not None:
+            parts = []
+            with pdfplumber.open(uploaded_file) as pdf:
+                for page in pdf.pages:
+                    txt = page.extract_text()
+                    if txt:
+                        parts.append(txt)
+            return "\n".join(parts)
 
-        if file_name.endswith(".docx"):
-            return read_docx_text(uploaded_file)
+        if lower.endswith(".docx") and docx is not None:
+            document = docx.Document(uploaded_file)
+            return "\n".join([p.text for p in document.paragraphs])
 
-        if file_name.endswith(".txt"):
+        if lower.endswith(".txt"):
             return uploaded_file.read().decode("utf-8", errors="ignore")
 
     except Exception:
@@ -480,10 +551,110 @@ def read_uploaded_cv(uploaded_file):
     return ""
 
 
+def preview_document(path, name):
+    if not path or not os.path.exists(path):
+        st.info("No saved file available for this document.")
+        return
+
+    ext = file_ext(path)
+
+    if ext == ".pdf":
+        with open(path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+
+        st.markdown(
+            f"""
+            <iframe src="data:application/pdf;base64,{encoded}"
+                    width="100%"
+                    height="650"
+                    type="application/pdf">
+            </iframe>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    elif ext in [".png", ".jpg", ".jpeg"]:
+        st.image(path, caption=name, width="stretch")
+
+    elif ext in [".txt", ".docx"]:
+        text = read_text_from_path(path)
+
+        if text.strip():
+            st.text_area(
+                "Document Preview",
+                value=text[:8000],
+                height=420,
+                key=f"preview_{safe_filename(name)}",
+            )
+        else:
+            st.warning("Could not extract text from this file.")
+
+    else:
+        st.info("Preview not supported for this file type. Please download it.")
+
+
+def create_zip_for_docs(docs_df):
+    buffer = BytesIO()
+    count = 0
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for _, row in docs_df.iterrows():
+            path = str(row.get("File Path", ""))
+            fname = str(row.get("File Name", "")) or os.path.basename(path)
+
+            if path and os.path.exists(path):
+                linked = str(row.get("Linked Application", "")).strip()
+                folder = "General"
+
+                if linked and linked != "Not linked / General":
+                    folder = safe_filename(linked.replace("|", "_"))[:100]
+
+                zipf.write(path, arcname=f"{folder}/{fname}")
+                count += 1
+
+    buffer.seek(0)
+    return buffer, count
+
+
+# =========================================================
+# LABEL HELPERS
+# =========================================================
+def app_label(index, row):
+    date_text = row["Date Applied"].strftime("%Y-%m-%d") if pd.notna(row["Date Applied"]) else ""
+    return f"{index} | {row['Company']} | {row['Role']} | {date_text} | {row['Status']}"
+
+
+def app_options(apps_df):
+    options = ["Not linked / General"]
+
+    if apps_df.empty:
+        return options
+
+    for idx, row in apps_df.sort_values("Date Applied", ascending=False).iterrows():
+        options.append(app_label(idx, row))
+
+    return options
+
+
+def parse_app_label(label):
+    if not label or label == "Not linked / General":
+        return "", "", ""
+
+    parts = [p.strip() for p in str(label).split("|")]
+
+    if len(parts) >= 4:
+        return label, parts[1], parts[2]
+
+    return label, "", ""
+
+
+# =========================================================
+# ML / NLP HELPERS
+# =========================================================
 def clean_text(text):
     text = str(text).lower()
     text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[^a-zA-ZäöüÄÖÜß0-9+#./\- ]", " ", text)
+    text = re.sub(r"[^a-zA-ZäöüÄÖÜß0-9+#./\\- ]", " ", text)
     return text.strip()
 
 
@@ -493,6 +664,7 @@ def extract_skills(text):
 
     for skill in COMMON_SKILLS:
         pattern = r"\b" + re.escape(skill.lower()) + r"\b"
+
         if re.search(pattern, cleaned):
             found.append(skill)
 
@@ -500,26 +672,13 @@ def extract_skills(text):
 
 
 def tfidf_similarity(text_a, text_b):
-    if not text_a.strip() or not text_b.strip():
+    if not str(text_a).strip() or not str(text_b).strip():
         return 0
 
     vectorizer = TfidfVectorizer(ngram_range=(1, 2))
     matrix = vectorizer.fit_transform([text_a, text_b])
     score = cosine_similarity(matrix[0:1], matrix[1:2])[0][0]
-    return round(score * 100)
 
-
-def semantic_similarity(text_a, text_b):
-    if not text_a.strip() or not text_b.strip():
-        return 0
-
-    model = load_embedding_model()
-
-    if model is None:
-        return tfidf_similarity(text_a, text_b)
-
-    embeddings = model.encode([text_a, text_b])
-    score = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
     return round(score * 100)
 
 
@@ -532,8 +691,8 @@ def keyword_score(cv_text, job_text):
 
     matched = sorted(cv_skills.intersection(job_skills))
     missing = sorted(job_skills.difference(cv_skills))
-
     score = round((len(matched) / len(job_skills)) * 100)
+
     return score, matched, missing
 
 
@@ -541,59 +700,27 @@ def section_score(cv_text):
     cleaned = clean_text(cv_text)
 
     sections = {
-        "Education / Ausbildung": [
-            "education", "university", "master", "bachelor", "degree",
-            "ausbildung", "universität", "studium", "abschluss",
-        ],
-        "Experience / Erfahrung": [
-            "experience", "work experience", "employment", "internship",
-            "erfahrung", "berufserfahrung", "praktikum", "beschäftigung",
-        ],
-        "Skills / Fähigkeiten": [
-            "skills", "technical skills", "tools", "technologies",
-            "fähigkeiten", "kenntnisse", "technologien", "werkzeuge",
-        ],
-        "Projects / Projekte": [
-            "projects", "project", "projekte", "projekt",
-        ],
-        "Contact / Kontakt": [
-            "email", "phone", "linkedin", "github",
-            "e-mail", "telefon", "kontakt",
-        ],
+        "Education / Ausbildung": ["education", "university", "master", "bachelor", "degree", "ausbildung", "studium"],
+        "Experience / Erfahrung": ["experience", "work experience", "internship", "employment", "erfahrung", "praktikum"],
+        "Skills / Fähigkeiten": ["skills", "technical skills", "tools", "technologies", "fähigkeiten", "kenntnisse"],
+        "Projects / Projekte": ["projects", "project", "projekte", "projekt"],
+        "Contact / Kontakt": ["email", "phone", "linkedin", "github", "kontakt", "telefon"],
     }
 
-    found_sections = []
+    found = []
 
     for section, keywords in sections.items():
-        if any(keyword in cleaned for keyword in keywords):
-            found_sections.append(section)
+        if any(k in cleaned for k in keywords):
+            found.append(section)
 
-    score = round((len(found_sections) / len(sections)) * 100)
-    missing_sections = sorted(set(sections.keys()) - set(found_sections))
+    missing = sorted(set(sections.keys()) - set(found))
+    score = round((len(found) / len(sections)) * 100)
 
-    return score, found_sections, missing_sections
+    return score, found, missing
 
 
-def generate_cv_suggestions(missing_keywords, missing_sections, final_score):
-    suggestions = []
-
-    if missing_keywords:
-        top_missing = ", ".join(missing_keywords[:8])
-        suggestions.append(f"Add or make clearer these job keywords in your CV: {top_missing}.")
-
-    if missing_sections:
-        suggestions.append(f"Consider adding or clarifying these CV sections: {', '.join(missing_sections)}.")
-
-    if final_score < 50:
-        suggestions.append("The CV seems weakly aligned with this job. Tailor the skills and experience bullets more directly to the job description.")
-    elif final_score < 75:
-        suggestions.append("The CV has a moderate match. Add more role-specific keywords and quantify relevant project or work experience.")
-    else:
-        suggestions.append("The CV looks reasonably aligned. Focus on small improvements and clearer evidence for the most important job requirements.")
-
-    suggestions.append("Use exact wording from the job description where it truthfully matches your experience.")
-
-    return suggestions
+def final_match_score(semantic, keyword, section):
+    return round((0.55 * semantic) + (0.30 * keyword) + (0.15 * section))
 
 
 def analyze_job_description(job_text):
@@ -602,325 +729,129 @@ def analyze_job_description(job_text):
 
     seniority = "Not clear"
 
-    if re.search(
-        r"\binternship\b|\bintern\b|\bworking student\b|\btrainee\b|"
-        r"\bpraktikum\b|\bpraktikant\b|\bpraktikantin\b|\bwerkstudent\b|\bwerkstudentin\b",
-        cleaned,
-    ):
+    if re.search(r"\binternship\b|\bintern\b|\bworking student\b|\btrainee\b|\bpraktikum\b|\bwerkstudent\b", cleaned):
         seniority = "Internship / Working Student / Trainee"
 
-    elif re.search(
-        r"\bjunior\b|\bentry level\b|\bgraduate\b|"
-        r"\beinsteiger\b|\bberufseinsteiger\b|\bberufseinsteigerin\b",
-        cleaned,
-    ):
+    elif re.search(r"\bjunior\b|\bentry level\b|\bgraduate\b|\beinsteiger\b", cleaned):
         seniority = "Junior / Entry-level"
 
-    elif re.search(
-        r"\bmid\b|\bprofessional\b|\b2\+ years\b|\b3\+ years\b|"
-        r"\b2 jahre\b|\b3 jahre\b|\bberufserfahrung\b",
-        cleaned,
-    ):
-        seniority = "Mid-level"
-
-    elif re.search(
-        r"\bsenior\b|\blead\b|\b5\+ years\b|\b7\+ years\b|"
-        r"\b5 jahre\b|\b7 jahre\b|\bleitung\b|\bteamlead\b",
-        cleaned,
-    ):
+    elif re.search(r"\bsenior\b|\blead\b|\b5\+ years\b|\b7\+ years\b", cleaned):
         seniority = "Senior"
+
+    elif re.search(r"\b2\+ years\b|\b3\+ years\b|\bprofessional\b|\bberufserfahrung\b", cleaned):
+        seniority = "Mid-level"
 
     red_flags = []
 
-    if re.search(
-        r"\bc1\b|\bnative german\b|\bfluent german\b|"
-        r"\bdeutsch c1\b|\bdeutschkenntnisse c1\b|\bmuttersprache deutsch\b|"
-        r"\bverhandlungssicheres deutsch\b",
-        cleaned,
-    ):
+    if re.search(r"\bc1\b|\bfluent german\b|\bnative german\b|\bverhandlungssicheres deutsch\b", cleaned):
         red_flags.append("Strong German requirement")
 
-    if re.search(r"\bfull-time\b|\bfull time\b|\bvollzeit\b", cleaned):
+    if re.search(r"\bfull-time\b|\bvollzeit\b", cleaned):
         red_flags.append("Full-time requirement")
 
-    if re.search(
-        r"\b5\+ years\b|\b7\+ years\b|\bsenior\b|"
-        r"\b5 jahre\b|\b7 jahre\b|\blangjährige berufserfahrung\b",
-        cleaned,
-    ):
+    if re.search(r"\b5\+ years\b|\b7\+ years\b|\bsenior\b", cleaned):
         red_flags.append("High experience requirement")
 
-    if re.search(
-        r"\btravel\b|\brelocation\b|\breisebereitschaft\b|\bumzug\b",
-        cleaned,
-    ):
-        red_flags.append("Travel / relocation may be required")
-
-    responsibilities_keywords = [
-        "analyze", "build", "develop", "design", "maintain", "report",
-        "visualize", "communicate", "collaborate", "optimize", "automate",
-        "clean", "model", "present", "support",
-        "analysieren", "entwickeln", "erstellen", "gestalten", "pflegen",
-        "berichten", "visualisieren", "kommunizieren", "zusammenarbeiten",
-        "optimieren", "automatisieren", "bereinigen", "modellieren",
-        "präsentieren", "unterstützen",
+    responsibilities = []
+    verbs = [
+        "analyze", "build", "develop", "design", "maintain", "report", "visualize",
+        "communicate", "collaborate", "optimize", "automate",
+        "analysieren", "entwickeln", "erstellen", "berichten", "visualisieren",
+        "kommunizieren", "optimieren",
     ]
 
-    responsibilities = []
-    sentences = re.split(r"[.\n]", job_text)
+    for sentence in re.split(r"[.\n]", job_text):
+        sent = sentence.strip()
 
-    for sentence in sentences:
-        s_clean = clean_text(sentence)
-        if any(word in s_clean for word in responsibilities_keywords):
-            if len(sentence.strip()) > 25:
-                responsibilities.append(sentence.strip())
+        if len(sent) > 25 and any(v in clean_text(sent) for v in verbs):
+            responsibilities.append(sent)
 
-    responsibilities = responsibilities[:6]
-
-    if len(job_text.strip()) > 0:
-        simple_summary = (
-            "This role appears to focus on "
-            + (", ".join(skills[:6]) if skills else "general job-related responsibilities")
-            + ". The main fit depends on matching your CV with the required skills, tools, and responsibilities."
-        )
-    else:
-        simple_summary = "No job description provided."
+    summary = (
+        "This role appears to focus on "
+        + (", ".join(skills[:6]) if skills else "general job-related responsibilities")
+        + "."
+    )
 
     return {
-        "summary": simple_summary,
+        "summary": summary,
         "skills": skills,
         "seniority": seniority,
         "red_flags": red_flags,
-        "responsibilities": responsibilities,
+        "responsibilities": responsibilities[:6],
     }
-
-
-def final_match_score(semantic, keyword, section):
-    return round((0.55 * semantic) + (0.30 * keyword) + (0.15 * section))
 
 
 # =========================================================
-# CSS
+# METRICS / RENDER
 # =========================================================
-st.markdown(
-    """
-<style>
-    .block-container {
-        padding-top: 1.1rem;
-        padding-left: 1.4rem;
-        padding-right: 1.4rem;
-        padding-bottom: 1rem;
-        max-width: 100%;
+def calculate_metrics(df):
+    total = len(df)
+    interviews = len(df[df["Status"] == "Interview"])
+    offers = len(df[df["Status"] == "Offer"])
+    rejected = len(df[df["Status"] == "Rejected"])
+    active = len(df[df["Status"].isin(["Applied", "Screening", "Phone Screen", "Interview"])])
+    responded = len(df[df["Status"].isin(["Screening", "Phone Screen", "Interview", "Offer", "Rejected"])])
+
+    return {
+        "total": total,
+        "interviews": interviews,
+        "offers": offers,
+        "rejected": rejected,
+        "active": active,
+        "response_rate": round((responded / total) * 100) if total else 0,
+        "offer_rate": round((offers / total) * 100) if total else 0,
     }
 
-    [data-testid="stSidebar"] {
-        background-color: #F8FAFC;
-        border-right: 1px solid #E5E7EB;
-    }
 
-    [data-testid="stSidebar"] > div:first-child {
-        padding-top: 1.7rem;
-    }
+def render_kpi(col, title, value, subtitle, icon, bg_color, sub_color="#10B981"):
+    with col:
+        st.markdown(
+            f"""
+            <div class="kpi-card">
+                <div class="kpi-top">
+                    <div class="kpi-icon" style="background:{bg_color};">{icon}</div>
+                    <div>
+                        <div class="kpi-title">{title}</div>
+                        <div class="kpi-value">{value}</div>
+                    </div>
+                </div>
+                <div class="kpi-sub" style="color:{sub_color};">{subtitle}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    h1 {
-        font-size: 32px !important;
-        font-weight: 850 !important;
-        color: #111827 !important;
-        margin-bottom: 0 !important;
-    }
 
-    h2, h3 {
-        color: #111827 !important;
-        font-weight: 850 !important;
-    }
-
-    .brand-box {
-        background: white;
-        border: 1px solid #E5E7EB;
-        border-radius: 16px;
-        padding: 17px 16px;
-        margin-bottom: 18px;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-    }
-
-    .brand-title {
-        font-size: 22px;
-        font-weight: 850;
-        color: #111827;
-    }
-
-    .user-box {
-        margin-top: 24px;
-        border-top: 1px solid #E5E7EB;
-        padding-top: 16px;
-        color: #334155;
-        font-size: 14px;
-        line-height: 1.45;
-    }
-
-    .kpi-card {
-        background: white;
-        border: 1px solid #E5E7EB;
-        border-radius: 18px;
-        padding: 17px;
-        box-shadow: 0 2px 8px rgba(15,23,42,0.04);
-        min-height: 124px;
-    }
-
-    .kpi-top {
-        display: flex;
-        align-items: center;
-        gap: 13px;
-    }
-
-    .kpi-icon {
-        width: 54px;
-        height: 54px;
-        border-radius: 16px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 24px;
-    }
-
-    .kpi-title {
-        color: #475569;
-        font-size: 15px;
-        font-weight: 650;
-        margin-bottom: 4px;
-    }
-
-    .kpi-value {
-        color: #0F172A;
-        font-size: 32px;
-        font-weight: 850;
-        line-height: 1;
-    }
-
-    .kpi-note-green {
-        color: #059669;
-        font-size: 13px;
-        font-weight: 750;
-        margin-top: 13px;
-    }
-
-    .kpi-note-red {
-        color: #EF4444;
-        font-size: 13px;
-        font-weight: 750;
-        margin-top: 13px;
-    }
-
-    .card {
-        background: white;
-        border: 1px solid #E5E7EB;
-        border-radius: 18px;
-        padding: 15px;
-        box-shadow: 0 2px 8px rgba(15,23,42,0.04);
-    }
-
-    .section-title {
-        color: #111827;
-        font-size: 18px;
-        font-weight: 850;
-        margin-bottom: 4px;
-    }
-
-    .small-muted {
-        color: #64748B;
-        font-size: 13px;
-    }
-
-    .insight-row {
-        border: 1px solid #EEF2F7;
-        border-radius: 14px;
-        padding: 12px 13px;
-        margin-bottom: 9px;
-        background: white;
-    }
-
-    .insight-title {
-        font-size: 15px;
-        font-weight: 850;
-        color: #111827;
-    }
-
-    .insight-sub {
-        font-size: 13px;
-        color: #64748B;
-        margin-top: 3px;
-    }
-
-    .right-value {
-        float: right;
-        font-weight: 850;
-    }
-
-    div[data-testid="stDataFrame"] {
-        border-radius: 14px;
-        overflow: hidden;
-        border: 1px solid #E5E7EB;
-    }
-
-    .stSelectbox label,
-    .stTextInput label,
-    .stDateInput label,
-    .stTextArea label,
-    .stMultiSelect label,
-    .stFileUploader label {
-        font-weight: 700 !important;
-        color: #334155 !important;
-    }
-
-    .stButton button {
-        border-radius: 12px;
-        font-weight: 750;
-    }
-
-    .mini-card {
-        background: white;
-        border: 1px solid #E5E7EB;
-        border-radius: 16px;
-        padding: 14px;
-        box-shadow: 0 1px 5px rgba(15,23,42,0.04);
-        min-height: 105px;
-    }
-
-    .mini-title {
-        color: #64748B;
-        font-size: 13px;
-        font-weight: 700;
-    }
-
-    .mini-value {
-        color: #0F172A;
-        font-size: 24px;
-        font-weight: 850;
-        margin-top: 5px;
-    }
-</style>
-""",
-    unsafe_allow_html=True,
-)
+def reset_dashboard_filters():
+    st.session_state["dashboard_month"] = "All"
+    st.session_state["dashboard_status"] = "All"
+    st.session_state["dashboard_source"] = "All"
+    st.session_state["dashboard_location"] = "All"
 
 
 # =========================================================
-# SESSION STATE
+# APP STATE
 # =========================================================
+ensure_files()
+
 if "page" not in st.session_state:
     st.session_state.page = "Dashboard"
 
+for key, default in [
+    ("dashboard_month", "All"),
+    ("dashboard_status", "All"),
+    ("dashboard_source", "All"),
+    ("dashboard_location", "All"),
+    ("confirm_delete_application", None),
+    ("confirm_delete_document", None),
+    ("confirm_delete_note", None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-def go_to_page(page_name):
-    st.session_state.page = page_name
-
-
-# =========================================================
-# LOAD DATA
-# =========================================================
-df = load_applications()
-documents_df = load_documents()
-notes_df = load_notes()
+apps = load_apps()
+docs = load_docs()
+notes = load_notes()
 
 
 # =========================================================
@@ -929,7 +860,7 @@ notes_df = load_notes()
 with st.sidebar:
     st.markdown("## 💼 JobTracker")
 
-    pages = [
+    sidebar_pages = [
         ("Dashboard", "📊"),
         ("Applications", "📄"),
         ("Calendar", "📅"),
@@ -940,15 +871,11 @@ with st.sidebar:
         ("Notes", "📝"),
     ]
 
-    for page_name, icon in pages:
-        button_type = "primary" if st.session_state.page == page_name else "secondary"
+    for page_name, icon in sidebar_pages:
+        btn_type = "primary" if st.session_state.page == page_name else "secondary"
 
-        if st.button(
-            f"{icon} {page_name}",
-            use_container_width=True,
-            type=button_type,
-        ):
-            go_to_page(page_name)
+        if st.button(f"{icon} {page_name}", type=btn_type, key=f"nav_{page_name}", **stretch()):
+            st.session_state.page = page_name
             st.rerun()
 
     st.divider()
@@ -959,742 +886,862 @@ with st.sidebar:
     st.markdown("**📌 Goal**")
     st.caption("Data / BI / ML roles")
 
-    sidebar_total = len(df)
-    sidebar_active = len(
-        df[df["Status"].isin(["Applied", "Screening", "Phone Screen", "Interview"])]
-    )
-    sidebar_interviews = len(df[df["Status"] == "Interview"])
-
-    s1, s2, s3 = st.columns(3)
-
-    with s1:
-        st.markdown(
-            f"""
-            <div style="text-align:center;">
-                <div style="font-size:11px; color:#64748B;">Apps</div>
-                <div style="font-size:22px; font-weight:850; color:#0F172A;">{sidebar_total}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with s2:
-        st.markdown(
-            f"""
-            <div style="text-align:center;">
-                <div style="font-size:11px; color:#64748B;">Active</div>
-                <div style="font-size:22px; font-weight:850; color:#0F172A;">{sidebar_active}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with s3:
-        st.markdown(
-            f"""
-            <div style="text-align:center;">
-                <div style="font-size:11px; color:#64748B;">Int.</div>
-                <div style="font-size:22px; font-weight:850; color:#0F172A;">{sidebar_interviews}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    sb1, sb2, sb3 = st.columns(3)
+    sb1.metric("Apps", len(apps))
+    sb2.metric("Active", len(apps[apps["Status"].isin(["Applied", "Screening", "Phone Screen", "Interview"])]))
+    sb3.metric("Int.", len(apps[apps["Status"] == "Interview"]))
 
     st.divider()
 
-    col1, col2 = st.columns(2)
+    b1, b2 = st.columns(2)
 
-    with col1:
-        st.link_button(
-            "LinkedIn",
-            "https://www.linkedin.com/in/elhadidy19/",
-            use_container_width=True,
-        )
+    with b1:
+        st.link_button("LinkedIn", "https://www.linkedin.com/in/elhadidy19/", **stretch())
 
-    with col2:
-        st.link_button(
-            "GitHub",
-            "https://github.com/elhadidy2025",
-            use_container_width=True,
-        )
+    with b2:
+        st.link_button("GitHub", "https://github.com/elhadidy2025", **stretch())
 
     st.caption("Demo app_Elhadidy · CSV upload supported")
 
 
 # =========================================================
-# SHARED COMPONENTS
+# REUSABLE FORMS
 # =========================================================
-def add_application_form(expanded=False):
+def add_application_ui(expanded=False):
     with st.expander("➕ Add New Application", expanded=expanded):
         with st.form("add_application_form", clear_on_submit=True):
-            f1, f2, f3 = st.columns(3)
+            c1, c2, c3 = st.columns(3)
 
-            with f1:
-                company = st.text_input("Company")
-                status = st.selectbox("Status", STATUS_OPTIONS)
+            with c1:
+                company = st.text_input("Company", key="add_company")
+                status = st.selectbox("Status", STATUS_OPTIONS, key="add_status")
 
-            with f2:
-                role = st.text_input("Role")
-                source = st.selectbox("Source", SOURCE_OPTIONS)
+            with c2:
+                role = st.text_input("Role", key="add_role")
+                source = st.selectbox("Source", SOURCE_OPTIONS, key="add_source")
 
-            with f3:
-                date_applied = st.date_input("Date Applied", value=date.today())
-                location = st.text_input("Location", value="Graz")
+            with c3:
+                applied_date = st.date_input("Date Applied", value=date.today(), key="add_date")
+                location = st.text_input("Location", value="Graz", key="add_location")
 
-            next_step = st.text_input("Next Step", value="Awaiting response")
+            next_step = st.text_input("Next Step", value="Awaiting response", key="add_next_step")
 
-            submitted = st.form_submit_button("Add Application", use_container_width=True)
-
-            if submitted:
+            if st.form_submit_button("Add Application", **stretch()):
                 if not company.strip() or not role.strip():
                     st.error("Please enter at least Company and Role.")
                 else:
-                    add_application(
-                        company=company.strip(),
-                        role=role.strip(),
-                        date_applied=date_applied.strftime("%Y-%m-%d"),
-                        status=status,
-                        source=source,
-                        location=location.strip(),
-                        next_step=next_step.strip(),
+                    current = load_apps()
+                    new_row = pd.DataFrame(
+                        [[
+                            company.strip(),
+                            role.strip(),
+                            applied_date.strftime("%Y-%m-%d"),
+                            status,
+                            source,
+                            location.strip(),
+                            next_step.strip(),
+                        ]],
+                        columns=APP_COLUMNS,
                     )
+                    save_apps(pd.concat([current[APP_COLUMNS], new_row], ignore_index=True))
                     st.success("Application added successfully.")
                     st.rerun()
 
 
-def upload_csv_component(expanded=False):
+def upload_csv_ui(expanded=False):
     with st.expander("📤 Upload CSV and Visualize", expanded=expanded):
-        uploaded_file = st.file_uploader("Upload your CSV file", type=["csv"])
+        uploaded_file = st.file_uploader("Upload applications CSV", type=["csv"], key="applications_csv_upload")
 
         if uploaded_file is None:
-            st.info("Upload a CSV file. Extra columns will be ignored.")
+            st.info("CSV columns can be: Company, Role, Date Applied, Status, Source, Location, Next Step.")
             return
 
         try:
-            uploaded_df = pd.read_csv(uploaded_file)
+            uploaded = pd.read_csv(uploaded_file)
         except Exception as e:
-            st.error(f"Could not read CSV file: {e}")
+            st.error(f"Could not read CSV: {e}")
             return
 
-        if uploaded_df.empty:
-            st.warning("The uploaded CSV is empty.")
-            return
+        st.dataframe(uploaded.head(10), hide_index=True, **stretch())
 
-        st.markdown("### Preview")
-        st.dataframe(uploaded_df.head(10), use_container_width=True, hide_index=True)
+        imported = uploaded.copy()
 
-        st.markdown("### Column Mapping")
+        defaults = {
+            "Company": "Unknown Company",
+            "Role": "Unknown Role",
+            "Date Applied": date.today().strftime("%Y-%m-%d"),
+            "Status": "Applied",
+            "Source": "Other",
+            "Location": "—",
+            "Next Step": "Awaiting response",
+        }
 
-        csv_columns = ["None"] + uploaded_df.columns.tolist()
-        mapping = {}
+        for col in APP_COLUMNS:
+            if col not in imported.columns:
+                imported[col] = defaults[col]
 
-        m1, m2, m3 = st.columns(3)
+        imported = imported[APP_COLUMNS].copy()
+        imported["Status"] = imported["Status"].apply(normalize_status)
+        imported["Source"] = imported["Source"].apply(normalize_source)
 
-        with m1:
-            for target_col in ["Company", "Role"]:
-                guessed = guess_column(uploaded_df.columns.tolist(), target_col)
-                default_index = csv_columns.index(guessed) if guessed in csv_columns else 0
-                mapping[target_col] = st.selectbox(
-                    f"{target_col}",
-                    csv_columns,
-                    index=default_index,
-                    key=f"map_{target_col}",
-                )
+        b1, b2 = st.columns(2)
 
-        with m2:
-            for target_col in ["Date Applied", "Status"]:
-                guessed = guess_column(uploaded_df.columns.tolist(), target_col)
-                default_index = csv_columns.index(guessed) if guessed in csv_columns else 0
-                mapping[target_col] = st.selectbox(
-                    f"{target_col}",
-                    csv_columns,
-                    index=default_index,
-                    key=f"map_{target_col}",
-                )
-
-        with m3:
-            for target_col in ["Source", "Location", "Next Step"]:
-                guessed = guess_column(uploaded_df.columns.tolist(), target_col)
-                default_index = csv_columns.index(guessed) if guessed in csv_columns else 0
-                mapping[target_col] = st.selectbox(
-                    f"{target_col}",
-                    csv_columns,
-                    index=default_index,
-                    key=f"map_{target_col}",
-                )
-
-        imported_apps = build_imported_applications(uploaded_df, mapping)
-
-        st.markdown("### Imported Preview")
-        preview = imported_apps[DEFAULT_COLUMNS].copy()
-        preview["Date Applied"] = preview["Date Applied"].dt.strftime("%Y-%m-%d")
-        st.dataframe(preview.head(10), use_container_width=True, hide_index=True)
-
-        st.warning("Replace will overwrite your current applications.csv. Merge will add uploaded rows to existing data.")
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-            if st.button("Replace Current Data", use_container_width=True, type="primary"):
-                save_applications(imported_apps)
-                st.success("Current data replaced with uploaded CSV.")
-                st.rerun()
-
-        with c2:
-            if st.button("Merge With Current Data", use_container_width=True):
-                current = load_applications()
-                merged = pd.concat([current[DEFAULT_COLUMNS], imported_apps[DEFAULT_COLUMNS]], ignore_index=True)
-                save_applications(merged)
-                st.success("Uploaded CSV merged with current data.")
-                st.rerun()
-
-
-def calculate_metrics(data):
-    total = len(data)
-    interviews = len(data[data["Status"] == "Interview"])
-    offers = len(data[data["Status"] == "Offer"])
-    rejections = len(data[data["Status"] == "Rejected"])
-
-    active_statuses = ["Applied", "Screening", "Phone Screen", "Interview"]
-    active = len(data[data["Status"].isin(active_statuses)])
-
-    responded = len(data[data["Status"].isin(["Screening", "Phone Screen", "Interview", "Offer", "Rejected"])])
-    response_rate = round((responded / total) * 100) if total > 0 else 0
-    offer_rate = round((offers / total) * 100) if total > 0 else 0
-    rejection_rate = round((rejections / total) * 100) if total > 0 else 0
-
-    return {
-        "total": total,
-        "interviews": interviews,
-        "offers": offers,
-        "rejections": rejections,
-        "active": active,
-        "response_rate": response_rate,
-        "offer_rate": offer_rate,
-        "rejection_rate": rejection_rate,
-    }
-
-
-def get_dashboard_filters(data):
-    months = ["All"] + sorted(data["Month"].dropna().unique().tolist())
-    statuses = ["All"] + sorted(data["Status"].dropna().unique().tolist())
-    sources = ["All"] + sorted(data["Source"].dropna().unique().tolist())
-    locations = ["All"] + sorted(data["Location"].dropna().unique().tolist())
-
-    header_col, month_col, status_col, source_col, location_col, reset_col = st.columns(
-        [3.1, 1.05, 1.05, 1.05, 1.05, 0.8]
-    )
-
-    with header_col:
-        st.markdown("<h1>Job Application Tracker Dashboard</h1>", unsafe_allow_html=True)
-
-    with month_col:
-        selected_month = st.selectbox("Month", months, index=0)
-
-    with status_col:
-        selected_status = st.selectbox("Status", statuses, index=0)
-
-    with source_col:
-        selected_source = st.selectbox("Source", sources, index=0)
-
-    with location_col:
-        selected_location = st.selectbox("Location", locations, index=0)
-
-    with reset_col:
-        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-        if st.button("Reset", use_container_width=True):
+        if b1.button("Replace Current Data", type="primary", key="replace_csv", **stretch()):
+            save_apps(imported)
+            st.success("Current data replaced.")
             st.rerun()
 
-    filtered = data.copy()
-
-    if selected_month != "All":
-        filtered = filtered[filtered["Month"] == selected_month]
-
-    if selected_status != "All":
-        filtered = filtered[filtered["Status"] == selected_status]
-
-    if selected_source != "All":
-        filtered = filtered[filtered["Source"] == selected_source]
-
-    if selected_location != "All":
-        filtered = filtered[filtered["Location"] == selected_location]
-
-    return filtered
+        if b2.button("Merge With Current Data", key="merge_csv", **stretch()):
+            current = load_apps()
+            save_apps(pd.concat([current[APP_COLUMNS], imported], ignore_index=True))
+            st.success("Uploaded CSV merged.")
+            st.rerun()
 
 
 # =========================================================
-# DASHBOARD PAGE
+# PAGES
 # =========================================================
-def render_dashboard():
-    filtered_df = get_dashboard_filters(df)
-    metrics = calculate_metrics(filtered_df)
+def dashboard_page():
+    st.markdown("<h1>Job Application<br>Tracker Dashboard</h1>", unsafe_allow_html=True)
 
-    add_application_form(expanded=False)
-    upload_csv_component(expanded=False)
+    months = ["All"] + sorted(apps["Month"].dropna().unique().tolist())
+    statuses = ["All"] + sorted(apps["Status"].dropna().unique().tolist())
+    sources = ["All"] + sorted(apps["Source"].dropna().unique().tolist())
+    locations = ["All"] + sorted(apps["Location"].dropna().astype(str).unique().tolist())
 
-    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+    f1, f2, f3, f4, f5 = st.columns([1, 1, 1, 1, 0.55])
 
-    k1, k2, k3, k4, k5 = st.columns(5)
+    with f1:
+        st.selectbox(" ", months, key="dashboard_month", label_visibility="collapsed")
 
-    with k1:
-        st.markdown(f"""<div class="kpi-card"><div class="kpi-top"><div class="kpi-icon" style="background:#DBEAFE;">📄</div><div><div class="kpi-title">Total Applications</div><div class="kpi-value">{metrics["total"]}</div></div></div><div class="kpi-note-green">Live from your data</div></div>""", unsafe_allow_html=True)
+    with f2:
+        st.selectbox(" ", statuses, key="dashboard_status", label_visibility="collapsed")
 
-    with k2:
-        st.markdown(f"""<div class="kpi-card"><div class="kpi-top"><div class="kpi-icon" style="background:#F3E8FF;">👥</div><div><div class="kpi-title">Interviews</div><div class="kpi-value">{metrics["interviews"]}</div></div></div><div class="kpi-note-green">Interview stage</div></div>""", unsafe_allow_html=True)
+    with f3:
+        st.selectbox(" ", sources, key="dashboard_source", label_visibility="collapsed")
 
-    with k3:
-        st.markdown(f"""<div class="kpi-card"><div class="kpi-top"><div class="kpi-icon" style="background:#DCFCE7;">💼</div><div><div class="kpi-title">Offers</div><div class="kpi-value">{metrics["offers"]}</div></div></div><div class="kpi-note-green">Offer rate: {metrics["offer_rate"]}%</div></div>""", unsafe_allow_html=True)
+    with f4:
+        st.selectbox(" ", locations, key="dashboard_location", label_visibility="collapsed")
 
-    with k4:
-        st.markdown(f"""<div class="kpi-card"><div class="kpi-top"><div class="kpi-icon" style="background:#FEE2E2;">❌</div><div><div class="kpi-title">Rejections</div><div class="kpi-value">{metrics["rejections"]}</div></div></div><div class="kpi-note-red">Rejected applications</div></div>""", unsafe_allow_html=True)
-
-    with k5:
-        st.markdown(f"""<div class="kpi-card"><div class="kpi-top"><div class="kpi-icon" style="background:#FEF3C7;">%</div><div><div class="kpi-title">Response Rate</div><div class="kpi-value">{metrics["response_rate"]}%</div></div></div><div class="kpi-note-green">Non-applied responses</div></div>""", unsafe_allow_html=True)
-
-    st.markdown("<div style='height: 14px;'></div>", unsafe_allow_html=True)
-
-    pipeline_counts = filtered_df["Status"].value_counts().reindex(STATUS_OPTIONS, fill_value=0)
-    pipeline_labels = pipeline_counts.index.tolist()
-    pipeline_values = pipeline_counts.values.tolist()
-    pipeline_percentages = [
-        f"{round((value / metrics['total']) * 100) if metrics['total'] > 0 else 0}%"
-        for value in pipeline_values
-    ]
-    pipeline_colors = [STATUS_COLORS.get(status, "#64748B") for status in pipeline_labels]
-
-    month_counts = (
-        filtered_df.groupby(filtered_df["Date Applied"].dt.to_period("M"))
-        .size()
-        .reset_index(name="Applications")
-    )
-
-    if not month_counts.empty:
-        month_counts["Month"] = month_counts["Date Applied"].dt.strftime("%b %Y")
-    else:
-        month_counts = pd.DataFrame({"Month": [], "Applications": []})
-
-    source_counts = filtered_df["Source"].value_counts().reset_index()
-    source_counts.columns = ["Source", "Applications"]
-
-    chart_col1, chart_col2, chart_col3 = st.columns([1.25, 1.35, 1.25])
-
-    with chart_col1:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Application Pipeline</div>', unsafe_allow_html=True)
-
-        fig_pipeline = go.Figure()
-        fig_pipeline.add_trace(
-            go.Bar(
-                x=pipeline_values,
-                y=pipeline_labels,
-                orientation="h",
-                text=[f"{v} ({p})" for v, p in zip(pipeline_values, pipeline_percentages)],
-                textposition="outside",
-                marker=dict(color=pipeline_colors),
-                hoverinfo="skip",
-            )
-        )
-
-        max_x = max(pipeline_values) if pipeline_values else 1
-
-        fig_pipeline.update_layout(
-            height=265,
-            margin=dict(l=8, r=60, t=4, b=4),
-            xaxis=dict(showgrid=False, visible=False, range=[0, max_x + 2]),
-            yaxis=dict(autorange="reversed", showgrid=False, tickfont=dict(size=13, color="#334155")),
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            showlegend=False,
-        )
-
-        st.plotly_chart(fig_pipeline, use_container_width=True, config={"displayModeBar": False})
-        st.caption(f"Conversion rate (Applied → Offer): {metrics['offer_rate']}%")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with chart_col2:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Applications by Month</div>', unsafe_allow_html=True)
-
-        fig_month = go.Figure()
-        fig_month.add_trace(
-            go.Bar(
-                x=month_counts["Month"],
-                y=month_counts["Applications"],
-                text=month_counts["Applications"],
-                textposition="outside",
-                marker_color="#2563EB",
-                width=0.42,
-            )
-        )
-
-        y_max = int(month_counts["Applications"].max()) + 2 if not month_counts.empty else 5
-
-        fig_month.update_layout(
-            height=265,
-            margin=dict(l=8, r=8, t=6, b=4),
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            yaxis=dict(range=[0, y_max], gridcolor="#E5E7EB", tickfont=dict(size=12, color="#64748B")),
-            xaxis=dict(showgrid=False, tickfont=dict(size=12, color="#64748B")),
-            showlegend=False,
-        )
-
-        st.plotly_chart(fig_month, use_container_width=True, config={"displayModeBar": False})
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with chart_col3:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Applications by Source</div>', unsafe_allow_html=True)
-
-        fig_source = go.Figure()
-
-        if not source_counts.empty:
-            fig_source.add_trace(
-                go.Pie(
-                    labels=source_counts["Source"],
-                    values=source_counts["Applications"],
-                    hole=0.62,
-                    marker_colors=SOURCE_COLORS,
-                    textinfo="none",
-                    sort=False,
-                )
-            )
-
-        fig_source.update_layout(
-            height=265,
-            margin=dict(l=6, r=6, t=6, b=4),
-            paper_bgcolor="white",
-            annotations=[
-                dict(
-                    text=f"<b>{metrics['total']}</b><br>Total",
-                    x=0.5,
-                    y=0.5,
-                    font_size=20,
-                    showarrow=False,
-                )
-            ],
-            legend=dict(orientation="v", x=1.02, y=0.86, font=dict(size=12, color="#334155")),
-        )
-
-        st.plotly_chart(fig_source, use_container_width=True, config={"displayModeBar": False})
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div style='height: 14px;'></div>", unsafe_allow_html=True)
-
-    table_col, insight_col = st.columns([2.35, 1.15])
-
-    with table_col:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Recent Applications</div>', unsafe_allow_html=True)
-
-        display_df = filtered_df.copy().sort_values("Date Applied", ascending=False)
-
-        if not display_df.empty:
-            display_df["Date Applied"] = display_df["Date Applied"].dt.strftime("%b %d, %Y")
-            st.dataframe(display_df[DEFAULT_COLUMNS], use_container_width=True, hide_index=True, height=245)
-        else:
-            st.info("No applications match the selected filters.")
-
-        if st.button("View all applications", use_container_width=True):
-            go_to_page("Applications")
+    with f5:
+        if st.button("Reset", key="dashboard_reset", **stretch()):
+            reset_dashboard_filters()
             st.rerun()
 
-        st.markdown("</div>", unsafe_allow_html=True)
+    add_application_ui(expanded=False)
+    upload_csv_ui(expanded=False)
 
-    with insight_col:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Insights & Next Steps ✨</div>', unsafe_allow_html=True)
+    data = apps.copy()
 
-        if not source_counts.empty:
-            best_source = source_counts.iloc[0]["Source"]
-            best_source_count = int(source_counts.iloc[0]["Applications"])
-        else:
-            best_source = "—"
-            best_source_count = 0
+    if st.session_state["dashboard_month"] != "All":
+        data = data[data["Month"] == st.session_state["dashboard_month"]]
 
-        pending_followups = len(
-            filtered_df[
-                filtered_df["Next Step"]
-                .fillna("")
-                .str.lower()
-                .str.contains("follow|await|response|recruiter|interview|assignment", regex=True)
-            ]
+    if st.session_state["dashboard_status"] != "All":
+        data = data[data["Status"] == st.session_state["dashboard_status"]]
+
+    if st.session_state["dashboard_source"] != "All":
+        data = data[data["Source"] == st.session_state["dashboard_source"]]
+
+    if st.session_state["dashboard_location"] != "All":
+        data = data[data["Location"] == st.session_state["dashboard_location"]]
+
+    m = calculate_metrics(data)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    render_kpi(c1, "Total Applications", m["total"], "Live from your data", "📄", "#E8EFFC", "#12A150")
+    render_kpi(c2, "Interviews", m["interviews"], "Interview stage", "👥", "#F0E7FF", "#12A150")
+    render_kpi(c3, "Offers", m["offers"], f"Offer rate: {m['offer_rate']}%", "💼", "#E7F8EE", "#12A150")
+    render_kpi(c4, "Rejections", m["rejected"], "Rejected applications", "❌", "#FDECEC", "#F1416C")
+    render_kpi(c5, "Response Rate", f"{m['response_rate']}%", "Non-applied responses", "％", "#FFF5D7", "#12A150")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    g1, g2, g3 = st.columns([1.05, 1.15, 1.1])
+
+    with g1:
+        st.markdown("### Application Pipeline")
+
+        status_counts = data["Status"].value_counts().reindex(STATUS_OPTIONS, fill_value=0).reset_index()
+        status_counts.columns = ["Status", "Applications"]
+
+        total = max(len(data), 1)
+        status_counts["Label"] = (
+            status_counts["Applications"].astype(str)
+            + " ("
+            + ((status_counts["Applications"] / total) * 100).round(0).astype(int).astype(str)
+            + "%)"
         )
 
-        upcoming_interviews = filtered_df[filtered_df["Status"] == "Interview"].copy()
-        upcoming_interviews = upcoming_interviews.sort_values("Date Applied", ascending=False)
+        fig = px.bar(
+            status_counts,
+            x="Applications",
+            y="Status",
+            orientation="h",
+            color="Status",
+            color_discrete_map=STATUS_COLORS,
+            text="Label",
+        )
 
-        if not upcoming_interviews.empty:
-            next_interview_company = upcoming_interviews.iloc[0]["Company"]
-            next_interview_role = upcoming_interviews.iloc[0]["Role"]
+        fig.update_layout(
+            height=300,
+            showlegend=False,
+            margin=dict(l=10, r=10, t=10, b=10),
+            xaxis_title="",
+            yaxis_title="",
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+
+        fig.update_traces(textposition="outside")
+        st.plotly_chart(fig, config={"displayModeBar": False}, **stretch())
+        st.caption(f"Conversion rate (Applied ➜ Offer): {m['offer_rate']}%")
+
+    with g2:
+        st.markdown("### Applications by Month")
+
+        month_counts = (
+            data.groupby(data["Date Applied"].dt.to_period("M"))
+            .size()
+            .reset_index(name="Applications")
+        )
+
+        if not month_counts.empty:
+            month_counts["Month"] = month_counts["Date Applied"].dt.strftime("%b %Y")
+
+            fig = px.bar(
+                month_counts,
+                x="Month",
+                y="Applications",
+                text="Applications",
+            )
+
+            fig.update_layout(
+                height=300,
+                margin=dict(l=10, r=10, t=10, b=10),
+                plot_bgcolor="white",
+                paper_bgcolor="white",
+                xaxis_title="",
+                yaxis_title="",
+                showlegend=False,
+            )
+
+            st.plotly_chart(fig, config={"displayModeBar": False}, **stretch())
         else:
-            next_interview_company = "No interview"
-            next_interview_role = "Keep applying"
+            st.info("No data available.")
+
+    with g3:
+        st.markdown("### Applications by Source")
+
+        source_counts = data["Source"].value_counts().reset_index()
+        source_counts.columns = ["Source", "Applications"]
+
+        if not source_counts.empty:
+            fig = px.pie(
+                source_counts,
+                names="Source",
+                values="Applications",
+                hole=0.62,
+            )
+
+            fig.update_layout(
+                height=300,
+                margin=dict(l=10, r=10, t=10, b=10),
+                annotations=[
+                    dict(
+                        text=f"{len(data)}<br>Total",
+                        x=0.5,
+                        y=0.5,
+                        font_size=16,
+                        showarrow=False,
+                    )
+                ],
+            )
+
+            st.plotly_chart(fig, config={"displayModeBar": False}, **stretch())
+        else:
+            st.info("No data available.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    lower_left, lower_right = st.columns([2.5, 1.1])
+
+    with lower_left:
+        st.markdown("### Recent Applications")
+
+        recent = data.sort_values("Date Applied", ascending=False).copy()
+        recent["Date Applied"] = recent["Date Applied"].dt.strftime("%b %d, %Y")
+
+        st.dataframe(recent[APP_COLUMNS], hide_index=True, height=330, **stretch())
+
+    with lower_right:
+        st.markdown("### Insights & Next Steps ✨")
+
+        interview_df = data[data["Status"].isin(["Interview", "Phone Screen"])].copy()
+        pending_df = data[data["Status"].isin(["Applied", "Screening", "Phone Screen", "Interview"])].copy()
+
+        upcoming_count = len(interview_df)
+        pending_count = len(pending_df)
+
+        top_interview = "No interview scheduled"
+
+        if not interview_df.empty:
+            first_row = interview_df.sort_values("Date Applied", ascending=False).iloc[0]
+            top_interview = f"{first_row['Company']} – {first_row['Role']}"
 
         st.markdown(
             f"""
-            <div class="insight-row">
-                <div class="insight-title">
-                    📅 Upcoming Interview
-                    <span class="right-value" style="color:#7C3AED;">{metrics["interviews"]}</span>
-                </div>
-                <div class="insight-sub">{next_interview_company} - {next_interview_role}</div>
-            </div>
-
-            <div class="insight-row">
-                <div class="insight-title">
-                    ⏰ Pending Follow-ups
-                    <span class="right-value" style="color:#F59E0B;">{pending_followups}</span>
-                </div>
-                <div class="insight-sub">Applications that may need follow-up</div>
-            </div>
-
-            <div class="insight-row">
-                <div class="insight-title">
-                    🎯 Best Source
-                    <span class="right-value" style="color:#10B981;">{best_source_count}</span>
-                </div>
-                <div class="insight-sub">{best_source}</div>
-            </div>
-
-            <div class="insight-row">
-                <div class="insight-title">
-                    📈 Active Applications
-                    <span class="right-value" style="color:#2563EB;">{metrics["active"]}</span>
-                </div>
-                <div class="insight-sub">Still in process</div>
+            <div class="small-info-card">
+                <div class="small-info-title">📅 Upcoming Interview <span class="small-info-num">{upcoming_count}</span></div>
+                <div class="small-info-sub">{top_interview}</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        if st.button("View full insights", use_container_width=True):
-            go_to_page("Insights")
-            st.rerun()
+        st.markdown(
+            f"""
+            <div class="small-info-card">
+                <div class="small-info-title">⏰ Pending Follow-ups <span class="small-info-num" style="color:#F59E0B;">{pending_count}</span></div>
+                <div class="small-info-sub">Applications that may need follow-up</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-        st.markdown("</div>", unsafe_allow_html=True)
+        if not pending_df.empty:
+            next_items = pending_df.sort_values("Date Applied", ascending=False).head(6)
+
+            for _, row in next_items.iterrows():
+                st.markdown(f"- **{row['Company']}** — {row['Role']}  \n  *{row['Next Step']}*")
+
+    st.download_button(
+        "⬇️ Download Current Dashboard Data as CSV",
+        data=dataframe_to_csv_bytes(data[APP_COLUMNS]),
+        file_name="dashboard_applications.csv",
+        mime="text/csv",
+        key="download_dashboard_csv",
+        **stretch(),
+    )
 
 
-# =========================================================
-# APPLICATIONS PAGE
-# =========================================================
-def render_applications():
+def applications_page():
     st.markdown("<h1>Applications</h1>", unsafe_allow_html=True)
-    st.caption("Manage all your job applications in one place.")
 
-    add_application_form(expanded=True)
-    upload_csv_component(expanded=True)
+    add_application_ui(expanded=True)
+    upload_csv_ui(expanded=False)
 
-    st.markdown("## Application Details")
+    st.markdown("## Application Table")
 
-    search = st.text_input("Search by company, role, source, location, or next step")
+    s1, s2, s3 = st.columns([1.3, 1, 1])
 
-    data = df.copy()
+    search = s1.text_input("Search", key="applications_search")
+    status_filter = s2.multiselect("Filter by Status", STATUS_OPTIONS, key="applications_status_filter")
+    source_filter = s3.multiselect("Filter by Source", SOURCE_OPTIONS, key="applications_source_filter")
+
+    data = apps.copy()
 
     if search.strip():
-        search_lower = search.lower()
+        token = search.lower()
         data = data[
-            data[DEFAULT_COLUMNS]
+            data[APP_COLUMNS]
             .astype(str)
-            .apply(lambda row: row.str.lower().str.contains(search_lower).any(), axis=1)
+            .apply(lambda row: row.str.lower().str.contains(token).any(), axis=1)
         ]
-
-    status_filter = st.multiselect("Filter by Status", STATUS_OPTIONS, default=[])
 
     if status_filter:
         data = data[data["Status"].isin(status_filter)]
 
-    display = data.copy().sort_values("Date Applied", ascending=False)
+    if source_filter:
+        data = data[data["Source"].isin(source_filter)]
 
-    if not display.empty:
-        display["Date Applied"] = display["Date Applied"].dt.strftime("%Y-%m-%d")
-        st.dataframe(display[DEFAULT_COLUMNS], use_container_width=True, hide_index=True, height=360)
-    else:
-        st.info("No applications found.")
+    display = data.sort_values("Date Applied", ascending=False).copy()
+    display["Date Applied"] = display["Date Applied"].dt.strftime("%Y-%m-%d")
 
-    st.markdown("## Edit or Delete Application")
+    st.dataframe(display[APP_COLUMNS], hide_index=True, height=350, **stretch())
 
-    if df.empty:
-        st.info("No records available.")
+    st.markdown("### Download Applications CSV")
+
+    d1, d2 = st.columns(2)
+
+    with d1:
+        st.download_button(
+            "⬇️ Download Filtered Applications",
+            data=dataframe_to_csv_bytes(display[APP_COLUMNS]),
+            file_name="filtered_applications.csv",
+            mime="text/csv",
+            key="download_filtered_applications",
+            **stretch(),
+        )
+
+    with d2:
+        st.download_button(
+            "⬇️ Download All Applications",
+            data=dataframe_to_csv_bytes(apps[APP_COLUMNS]),
+            file_name="all_applications.csv",
+            mime="text/csv",
+            key="download_all_applications",
+            **stretch(),
+        )
+
+    st.markdown("## Edit / Delete Application")
+
+    if apps.empty:
+        st.info("No applications available.")
         return
 
-    edit_options = []
+    options = [
+        app_label(idx, row)
+        for idx, row in apps.sort_values("Date Applied", ascending=False).iterrows()
+    ]
 
-    for idx, row in df.sort_values("Date Applied", ascending=False).iterrows():
-        label = f"{idx} | {row['Company']} | {row['Role']} | {row['Date Applied'].strftime('%Y-%m-%d')} | {row['Status']}"
-        edit_options.append(label)
-
-    selected_record = st.selectbox("Select application", edit_options)
-    selected_index = int(selected_record.split("|")[0].strip())
-    selected_row = df.loc[selected_index]
+    selected = st.selectbox("Select application", options, key="application_select_edit")
+    selected_idx = int(selected.split("|")[0].strip())
+    row = apps.loc[selected_idx]
 
     with st.form("edit_application_form"):
-        e1, e2, e3 = st.columns(3)
+        c1, c2, c3 = st.columns(3)
 
-        with e1:
-            company = st.text_input("Company", value=selected_row["Company"])
+        with c1:
+            company = st.text_input("Company", value=row["Company"], key="edit_company")
             status = st.selectbox(
                 "Status",
                 STATUS_OPTIONS,
-                index=STATUS_OPTIONS.index(selected_row["Status"]) if selected_row["Status"] in STATUS_OPTIONS else 0,
+                index=STATUS_OPTIONS.index(row["Status"]) if row["Status"] in STATUS_OPTIONS else 0,
+                key="edit_status",
             )
 
-        with e2:
-            role = st.text_input("Role", value=selected_row["Role"])
+        with c2:
+            role = st.text_input("Role", value=row["Role"], key="edit_role")
             source = st.selectbox(
                 "Source",
                 SOURCE_OPTIONS,
-                index=SOURCE_OPTIONS.index(selected_row["Source"]) if selected_row["Source"] in SOURCE_OPTIONS else 0,
+                index=SOURCE_OPTIONS.index(row["Source"]) if row["Source"] in SOURCE_OPTIONS else 0,
+                key="edit_source",
             )
 
-        with e3:
-            date_applied = st.date_input("Date Applied", value=selected_row["Date Applied"].date())
-            location = st.text_input("Location", value=selected_row["Location"])
+        with c3:
+            applied_date = st.date_input("Date Applied", value=row["Date Applied"].date(), key="edit_date")
+            location = st.text_input("Location", value=row["Location"], key="edit_location")
 
-        next_step = st.text_input("Next Step", value=selected_row["Next Step"])
+        next_step = st.text_input("Next Step", value=row["Next Step"], key="edit_next_step")
 
-        save_col, delete_col = st.columns(2)
+        b1, b2 = st.columns(2)
 
-        with save_col:
-            save_clicked = st.form_submit_button("Save Changes", use_container_width=True)
-
-        with delete_col:
-            delete_clicked = st.form_submit_button("Delete Record", use_container_width=True)
+        save_clicked = b1.form_submit_button("Save Changes", **stretch())
+        delete_clicked = b2.form_submit_button("Delete Record", **stretch())
 
         if save_clicked:
-            update_application(
-                selected_index,
-                company.strip(),
-                role.strip(),
-                date_applied.strftime("%Y-%m-%d"),
+            current = load_apps()
+            current.loc[selected_idx, APP_COLUMNS] = [
+                company,
+                role,
+                applied_date.strftime("%Y-%m-%d"),
                 status,
                 source,
-                location.strip(),
-                next_step.strip(),
-            )
-            st.success("Application updated successfully.")
+                location,
+                next_step,
+            ]
+            save_apps(current)
+            st.success("Application updated.")
             st.rerun()
 
         if delete_clicked:
-            delete_application(selected_index)
-            st.success("Application deleted successfully.")
+            st.session_state.confirm_delete_application = selected_idx
             st.rerun()
 
+    if st.session_state.confirm_delete_application == selected_idx:
+        st.warning(f"Are you sure you want to delete this application: {row['Company']} — {row['Role']}?")
 
-# =========================================================
-# DOCUMENTS PAGE
-# =========================================================
-def render_documents():
+        c1, c2 = st.columns(2)
+
+        with c1:
+            if st.button("Yes, delete application", key="confirm_delete_application_yes", **stretch()):
+                current = load_apps().drop(index=selected_idx).reset_index(drop=True)
+                save_apps(current)
+                st.session_state.confirm_delete_application = None
+                st.success("Application deleted.")
+                st.rerun()
+
+        with c2:
+            if st.button("Cancel", key="confirm_delete_application_cancel", **stretch()):
+                st.session_state.confirm_delete_application = None
+                st.rerun()
+
+    st.markdown("## Linked Documents")
+
+    linked = docs[docs["Linked Application"].astype(str) == selected].copy()
+
+    if linked.empty:
+        st.info("No documents linked to this application.")
+    else:
+        linked["Date Added"] = linked["Date Added"].dt.strftime("%Y-%m-%d")
+
+        st.dataframe(
+            linked[["Document Name", "Type", "Date Added", "File Name", "Notes"]],
+            hide_index=True,
+            height=230,
+            **stretch(),
+        )
+
+
+def calendar_page():
+    st.markdown("<h1>Calendar</h1>", unsafe_allow_html=True)
+    st.caption("Simple timeline view based on Date Applied and current application stage.")
+
+    if apps.empty:
+        st.info("No applications available.")
+        return
+
+    c1, c2 = st.columns([1, 1])
+
+    year_options = ["All"] + sorted(apps["Date Applied"].dt.year.dropna().astype(int).unique().tolist())
+    month_options = ["All"] + list(range(1, 13))
+
+    selected_year = c1.selectbox("Year", year_options, key="calendar_year")
+    selected_month = c2.selectbox("Month", month_options, key="calendar_month")
+
+    cal_df = apps.copy()
+
+    if selected_year != "All":
+        cal_df = cal_df[cal_df["Date Applied"].dt.year == selected_year]
+
+    if selected_month != "All":
+        cal_df = cal_df[cal_df["Date Applied"].dt.month == selected_month]
+
+    cal_df = cal_df.sort_values("Date Applied", ascending=True)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Events", len(cal_df))
+    m2.metric("Upcoming Interviews", len(cal_df[cal_df["Status"].isin(["Interview", "Phone Screen"])]))
+    m3.metric("Active Applications", len(cal_df[cal_df["Status"].isin(["Applied", "Screening", "Phone Screen", "Interview"])]))
+
+    if not cal_df.empty:
+        timeline_df = cal_df.copy()
+        timeline_df["Label"] = timeline_df["Company"] + " — " + timeline_df["Role"]
+
+        fig = px.scatter(
+            timeline_df,
+            x="Date Applied",
+            y="Company",
+            color="Status",
+            color_discrete_map=STATUS_COLORS,
+            hover_name="Label",
+            hover_data=["Role", "Location", "Source", "Next Step"],
+            size_max=14,
+        )
+
+        fig.update_layout(
+            height=420,
+            margin=dict(l=10, r=10, t=20, b=10),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            xaxis_title="Date",
+            yaxis_title="Company",
+        )
+
+        st.plotly_chart(fig, config={"displayModeBar": False}, **stretch())
+
+        table_df = cal_df.copy()
+        table_df["Date Applied"] = table_df["Date Applied"].dt.strftime("%Y-%m-%d")
+
+        st.dataframe(
+            table_df[["Date Applied", "Company", "Role", "Status", "Location", "Next Step"]],
+            hide_index=True,
+            height=330,
+            **stretch(),
+        )
+    else:
+        st.info("No data for the selected period.")
+
+
+def companies_page():
+    st.markdown("<h1>Companies</h1>", unsafe_allow_html=True)
+
+    if apps.empty:
+        st.info("No applications available.")
+        return
+
+    grouped = apps.groupby("Company").agg(
+        Applications=("Company", "count"),
+        Roles=("Role", pd.Series.nunique),
+        Interviews=("Status", lambda s: int((s == "Interview").sum())),
+        Offers=("Status", lambda s: int((s == "Offer").sum())),
+        Rejections=("Status", lambda s: int((s == "Rejected").sum())),
+        Latest_Application=("Date Applied", "max"),
+        Location=("Location", lambda x: ", ".join(sorted(set(x.astype(str))))),
+    ).reset_index()
+
+    grouped["Active"] = grouped["Applications"] - grouped["Offers"] - grouped["Rejections"]
+    grouped["Latest_Application"] = pd.to_datetime(grouped["Latest_Application"]).dt.strftime("%Y-%m-%d")
+    grouped = grouped.sort_values(["Applications", "Interviews"], ascending=[False, False])
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Unique Companies", apps["Company"].nunique())
+    c2.metric("Total Roles Applied", apps["Role"].nunique())
+    c3.metric("Companies With Interviews", grouped[grouped["Interviews"] > 0]["Company"].nunique())
+
+    st.markdown("## Company Overview")
+    st.dataframe(grouped, hide_index=True, height=360, **stretch())
+
+    company_list = sorted(apps["Company"].unique().tolist())
+    selected_company = st.selectbox("Select company", company_list, key="selected_company_page")
+
+    company_apps = apps[apps["Company"] == selected_company].copy().sort_values("Date Applied", ascending=False)
+    company_apps_display = company_apps.copy()
+    company_apps_display["Date Applied"] = company_apps_display["Date Applied"].dt.strftime("%Y-%m-%d")
+
+    st.markdown(f"## Details — {selected_company}")
+    st.dataframe(company_apps_display[APP_COLUMNS], hide_index=True, height=260, **stretch())
+
+    linked_app_labels = [
+        app_label(idx, row)
+        for idx, row in company_apps.iterrows()
+    ]
+
+    company_docs = docs[docs["Linked Application"].isin(linked_app_labels)].copy()
+
+    if company_docs.empty:
+        st.info("No linked documents for this company.")
+    else:
+        company_docs["Date Added"] = company_docs["Date Added"].dt.strftime("%Y-%m-%d")
+
+        st.dataframe(
+            company_docs[["Document Name", "Type", "Date Added", "Role", "File Name", "Notes"]],
+            hide_index=True,
+            height=230,
+            **stretch(),
+        )
+
+
+def documents_page():
     st.markdown("<h1>Documents</h1>", unsafe_allow_html=True)
-    st.caption("Track documents, analyze job descriptions, and calculate local CV-to-job match scores in English or German.")
+    st.caption("Upload documents, link them to applications, preview them, and download them.")
 
-    tab1, tab2, tab3 = st.tabs(
-        [
-            "📁 Document Library",
-            "🧾 Job Description Analyzer",
-            "🎯 CV Match Score",
-        ]
-    )
+    tab1, tab2, tab3 = st.tabs(["📁 Document Library", "🧾 Job Description Analyzer", "🎯 CV Match Score"])
 
     with tab1:
-        with st.expander("➕ Add Document Record", expanded=True):
-            with st.form("add_document_form", clear_on_submit=True):
-                d1, d2, d3 = st.columns(3)
+        with st.expander("➕ Upload / Add Document", expanded=True):
+            with st.form("document_upload_form", clear_on_submit=True):
+                selected_app = st.selectbox(
+                    "Link to Application",
+                    app_options(apps),
+                    key="doc_link_application",
+                )
 
-                with d1:
-                    doc_name = st.text_input("Document Name", placeholder="CV_Data_Science_V1.pdf")
-                    doc_type = st.selectbox("Type", DOCUMENT_TYPES)
+                linked_app, linked_company, linked_role = parse_app_label(selected_app)
 
-                with d2:
-                    company = st.text_input("Company", placeholder="Infineon / Siemens / General")
-                    role = st.text_input("Role", placeholder="Data Science Intern")
+                c1, c2, c3 = st.columns(3)
 
-                with d3:
-                    date_added = st.date_input("Date Added", value=date.today())
+                with c1:
+                    uploaded = st.file_uploader(
+                        "Upload Document",
+                        type=["pdf", "docx", "txt", "png", "jpg", "jpeg"],
+                        key="document_file_upload",
+                    )
 
-                notes = st.text_area("Notes", placeholder="Used for Graz roles / tailored for BI positions")
+                    doc_name = st.text_input(
+                        "Document Name",
+                        placeholder="CV_Data_Science_V1.pdf",
+                        key="document_name_input",
+                    )
 
-                submitted = st.form_submit_button("Add Document", use_container_width=True)
+                    doc_type = st.selectbox(
+                        "Type",
+                        DOCUMENT_TYPES,
+                        key="document_type_select",
+                    )
 
-                if submitted:
-                    if not doc_name.strip():
-                        st.error("Please enter the document name.")
+                with c2:
+                    company = st.text_input("Company", value=linked_company, key="document_company_input")
+                    role = st.text_input("Role", value=linked_role, key="document_role_input")
+
+                with c3:
+                    added_date = st.date_input("Date Added", value=date.today(), key="document_date_input")
+
+                notes_text = st.text_area("Notes", key="document_notes_text")
+
+                if st.form_submit_button("Save Document", **stretch()):
+                    if uploaded is None and not doc_name.strip():
+                        st.error("Please upload a document or enter a document name.")
                     else:
-                        new_doc = pd.DataFrame(
-                            [[doc_name.strip(), doc_type, company.strip(), role.strip(), date_added.strftime("%Y-%m-%d"), notes.strip()]],
-                            columns=DOCUMENT_COLUMNS,
+                        if uploaded is not None and not doc_name.strip():
+                            doc_name = uploaded.name
+
+                        saved_name, saved_path = save_uploaded_file(
+                            uploaded,
+                            doc_type,
+                            company.strip(),
+                            role.strip(),
                         )
 
-                        updated_docs = pd.concat([documents_df[DOCUMENT_COLUMNS], new_doc], ignore_index=True)
-                        save_documents(updated_docs)
-                        st.success("Document record added.")
+                        new_doc = pd.DataFrame(
+                            [[
+                                doc_name.strip(),
+                                doc_type,
+                                linked_app,
+                                company.strip(),
+                                role.strip(),
+                                added_date.strftime("%Y-%m-%d"),
+                                saved_name,
+                                saved_path,
+                                notes_text.strip(),
+                            ]],
+                            columns=DOC_COLUMNS,
+                        )
+
+                        current = load_docs()
+                        save_docs(pd.concat([current[DOC_COLUMNS], new_doc], ignore_index=True))
+                        st.success("Document saved.")
                         st.rerun()
 
         st.markdown("## Document Library")
 
-        docs = load_documents()
+        uploaded_docs = docs[
+            docs["File Path"]
+            .astype(str)
+            .apply(lambda p: bool(str(p).strip()) and os.path.exists(str(p)))
+        ].copy()
+
+        if not uploaded_docs.empty:
+            zip_buffer, file_count = create_zip_for_docs(uploaded_docs)
+
+            st.download_button(
+                f"⬇️ Download All Documents as ZIP ({file_count} files)",
+                data=zip_buffer,
+                file_name="job_tracker_documents.zip",
+                mime="application/zip",
+                key="download_documents_zip",
+                **stretch(),
+            )
+        else:
+            st.info("No uploaded files available for bulk download.")
 
         if docs.empty:
             st.info("No documents added yet.")
         else:
-            display_docs = docs.copy()
-            display_docs["Date Added"] = display_docs["Date Added"].dt.strftime("%Y-%m-%d")
-            st.dataframe(display_docs, use_container_width=True, hide_index=True, height=360)
+            display = docs.copy()
+            display["Date Added"] = display["Date Added"].dt.strftime("%Y-%m-%d")
 
-            st.markdown("## Delete Document Record")
-            delete_options = []
+            st.dataframe(
+                display[[
+                    "Document Name",
+                    "Type",
+                    "Linked Application",
+                    "Company",
+                    "Role",
+                    "Date Added",
+                    "File Name",
+                    "Notes",
+                ]],
+                hide_index=True,
+                height=320,
+                **stretch(),
+            )
+
+            st.markdown("## View / Download / Delete")
+
+            options = []
 
             for idx, row in docs.iterrows():
                 date_text = row["Date Added"].strftime("%Y-%m-%d") if pd.notna(row["Date Added"]) else "No date"
-                delete_options.append(f"{idx} | {row['Document Name']} | {row['Type']} | {date_text}")
+                link_text = row["Linked Application"] if str(row["Linked Application"]).strip() else "General"
+                options.append(f"{idx} | {row['Document Name']} | {row['Type']} | {date_text} | {link_text}")
 
-            selected_doc = st.selectbox("Select document", delete_options)
+            selected_doc = st.selectbox("Select document", options, key="document_actions_select")
+            selected_idx = int(selected_doc.split("|")[0].strip())
+            selected_row = docs.loc[selected_idx]
 
-            if st.button("Delete Document", use_container_width=True):
-                selected_index = int(selected_doc.split("|")[0].strip())
-                docs = docs.drop(index=selected_index).reset_index(drop=True)
-                save_documents(docs)
-                st.success("Document deleted.")
+            file_path = str(selected_row["File Path"])
+            file_name = str(selected_row["File Name"] or selected_row["Document Name"])
+
+            b1, b2, b3 = st.columns(3)
+
+            view_clicked = b1.button("View Document", key="view_document_button", **stretch())
+
+            with b2:
+                if file_path and os.path.exists(file_path):
+                    with open(file_path, "rb") as f:
+                        st.download_button(
+                            "Download Document",
+                            data=f.read(),
+                            file_name=file_name,
+                            key="download_document_button",
+                            **stretch(),
+                        )
+                else:
+                    st.info("No saved file.")
+
+            delete_clicked = b3.button("Delete Document", key="delete_document_button", **stretch())
+
+            if delete_clicked:
+                st.session_state.confirm_delete_document = selected_idx
                 st.rerun()
+
+            if st.session_state.confirm_delete_document == selected_idx:
+                st.warning(f"Are you sure you want to delete this document: {selected_row['Document Name']}?")
+
+                c1, c2 = st.columns(2)
+
+                with c1:
+                    if st.button("Yes, delete document", key="confirm_delete_document_yes", **stretch()):
+                        if file_path and os.path.exists(file_path):
+                            os.remove(file_path)
+
+                        current = load_docs().drop(index=selected_idx).reset_index(drop=True)
+                        save_docs(current)
+
+                        st.session_state.confirm_delete_document = None
+                        st.success("Document deleted.")
+                        st.rerun()
+
+                with c2:
+                    if st.button("Cancel", key="confirm_delete_document_cancel", **stretch()):
+                        st.session_state.confirm_delete_document = None
+                        st.rerun()
+
+            if view_clicked:
+                st.markdown("### Preview")
+                preview_document(file_path, file_name)
+
+        st.markdown("## Documents by Application")
+
+        linked_docs = docs[docs["Linked Application"].astype(str).str.strip() != ""].copy()
+
+        if linked_docs.empty:
+            st.info("No linked documents yet.")
+        else:
+            summary = linked_docs.groupby("Linked Application").agg(
+                Documents=("Document Name", "count"),
+                Types=("Type", lambda x: ", ".join(sorted(set(x.astype(str))))),
+            ).reset_index().sort_values("Documents", ascending=False)
+
+            st.dataframe(summary, hide_index=True, height=260, **stretch())
 
     with tab2:
         st.markdown("## Job Description Analyzer")
-        st.caption("Paste a job description in English or German and get simplified insights locally.")
 
-        job_text = st.text_area(
-            "Paste Job Description",
-            height=260,
-            placeholder="Paste the full job description here...",
-            key="jd_analyzer_text",
-        )
+        jd_text = st.text_area("Paste Job Description", height=260, key="jd_analyzer_text")
 
-        if st.button("Analyze Job Description", use_container_width=True):
-            if not job_text.strip():
+        if st.button("Analyze Job Description", key="analyze_jd_button", **stretch()):
+            if not jd_text.strip():
                 st.error("Please paste a job description first.")
             else:
-                analysis = analyze_job_description(job_text)
+                analysis = analyze_job_description(jd_text)
 
-                a1, a2, a3 = st.columns(3)
-
-                with a1:
-                    st.markdown(f"""<div class="mini-card"><div class="mini-title">Detected Skills</div><div class="mini-value">{len(analysis["skills"])}</div></div>""", unsafe_allow_html=True)
-
-                with a2:
-                    st.markdown(f"""<div class="mini-card"><div class="mini-title">Seniority</div><div class="mini-value" style="font-size:18px;">{analysis["seniority"]}</div></div>""", unsafe_allow_html=True)
-
-                with a3:
-                    st.markdown(f"""<div class="mini-card"><div class="mini-title">Red Flags</div><div class="mini-value">{len(analysis["red_flags"])}</div></div>""", unsafe_allow_html=True)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Detected Skills", len(analysis["skills"]))
+                c2.metric("Seniority", analysis["seniority"])
+                c3.metric("Red Flags", len(analysis["red_flags"]))
 
                 st.markdown("### Simple Summary")
                 st.write(analysis["summary"])
 
-                st.markdown("### Required / Important Skills")
-                if analysis["skills"]:
-                    st.write(", ".join(analysis["skills"]))
-                else:
-                    st.info("No common technical skills detected from the current skill list.")
+                st.markdown("### Skills")
+                st.write(", ".join(analysis["skills"]) if analysis["skills"] else "No skills detected.")
 
-                st.markdown("### Main Responsibilities")
+                st.markdown("### Responsibilities")
+
                 if analysis["responsibilities"]:
                     for item in analysis["responsibilities"]:
                         st.markdown(f"- {item}")
@@ -1702,272 +1749,136 @@ def render_documents():
                     st.info("No clear responsibility sentences detected.")
 
                 st.markdown("### Red Flags")
+
                 if analysis["red_flags"]:
                     for flag in analysis["red_flags"]:
                         st.markdown(f"- ⚠️ {flag}")
                 else:
                     st.success("No obvious red flags detected.")
 
-                st.markdown("### Keywords to Consider for Your CV")
-                if analysis["skills"]:
-                    st.write(", ".join(analysis["skills"][:15]))
-                else:
-                    st.info("No keywords detected.")
-
     with tab3:
         st.markdown("## CV ↔ Job Match Score")
-        st.caption("Upload your CV and paste a job description. English and German are supported locally.")
+        st.caption("Upload a new CV or use an existing uploaded CV from the Document Library.")
 
-        if SENTENCE_TRANSFORMERS_AVAILABLE:
-            st.success("Local multilingual semantic model available: paraphrase-multilingual-MiniLM-L12-v2")
-        else:
-            st.warning("sentence-transformers not available. The app will fall back to TF-IDF similarity.")
+        source = st.radio(
+            "Choose CV source",
+            ["Upload new CV", "Use existing uploaded CV"],
+            horizontal=True,
+            key="cv_source_radio",
+        )
 
-        c1, c2 = st.columns([1, 1.4])
+        cv_text = ""
 
-        with c1:
-            cv_file = st.file_uploader(
-                "Upload CV",
-                type=["pdf", "docx", "txt"],
-                key="cv_match_upload",
-            )
+        left, right = st.columns([1, 1.4])
 
-        with c2:
-            match_job_text = st.text_area(
-                "Paste Job Description",
-                height=260,
-                placeholder="Paste the job description here...",
-                key="cv_match_job_text",
-            )
+        with left:
+            if source == "Upload new CV":
+                cv_file = st.file_uploader("Upload CV", type=["pdf", "docx", "txt"], key="cv_new_upload")
 
-        if st.button("Calculate Match Score", use_container_width=True):
-            if cv_file is None:
-                st.error("Please upload your CV first.")
+                if cv_file is not None:
+                    cv_text = read_uploaded_cv(cv_file)
+
+            else:
+                cv_docs = docs[
+                    (docs["Type"].astype(str).str.lower() == "cv")
+                    & (docs["File Path"].astype(str).str.strip() != "")
+                ].copy()
+
+                cv_docs = cv_docs[
+                    cv_docs["File Path"].apply(lambda p: os.path.exists(str(p)))
+                ]
+
+                if cv_docs.empty:
+                    st.warning("No uploaded CV files found in Document Library.")
+                else:
+                    cv_options = [
+                        f"{idx} | {row['Document Name']} | {row['Company']} | {row['Role']}"
+                        for idx, row in cv_docs.iterrows()
+                    ]
+
+                    selected_cv = st.selectbox("Select existing CV", cv_options, key="existing_cv_select")
+                    cv_idx = int(selected_cv.split("|")[0].strip())
+                    cv_row = cv_docs.loc[cv_idx]
+                    cv_path = str(cv_row["File Path"])
+                    cv_text = read_text_from_path(cv_path)
+
+                    if st.button("Preview Selected CV", key="preview_selected_cv", **stretch()):
+                        preview_document(cv_path, str(cv_row["File Name"]))
+
+        with right:
+            job_text = st.text_area("Paste Job Description", height=260, key="cv_match_job_text")
+
+        if st.button("Calculate Match Score", key="calculate_match_score", **stretch()):
+            if not cv_text.strip():
+                st.error("Please upload a readable CV or choose an existing readable CV.")
                 return
 
-            if not match_job_text.strip():
+            if not job_text.strip():
                 st.error("Please paste the job description first.")
                 return
 
-            cv_text = read_uploaded_cv(cv_file)
-
-            if not cv_text.strip():
-                st.error("Could not extract text from the CV. Try PDF with selectable text, DOCX, or TXT.")
-                return
-
-            semantic = semantic_similarity(cv_text, match_job_text)
-            keyword, matched_keywords, missing_keywords = keyword_score(cv_text, match_job_text)
+            semantic = tfidf_similarity(cv_text, job_text)
+            keyword, matched, missing = keyword_score(cv_text, job_text)
             section, found_sections, missing_sections = section_score(cv_text)
-            final_score = final_match_score(semantic, keyword, section)
+            final = final_match_score(semantic, keyword, section)
 
-            s1, s2, s3, s4 = st.columns(4)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Final Match Score", f"{final}%")
+            c2.metric("Similarity Score", f"{semantic}%")
+            c3.metric("Keyword Score", f"{keyword}%")
+            c4.metric("CV Section Score", f"{section}%")
 
-            with s1:
-                st.markdown(f"""<div class="mini-card"><div class="mini-title">Final Match Score</div><div class="mini-value">{final_score}%</div></div>""", unsafe_allow_html=True)
-
-            with s2:
-                st.markdown(f"""<div class="mini-card"><div class="mini-title">Semantic Score</div><div class="mini-value">{semantic}%</div></div>""", unsafe_allow_html=True)
-
-            with s3:
-                st.markdown(f"""<div class="mini-card"><div class="mini-title">Keyword Score</div><div class="mini-value">{keyword}%</div></div>""", unsafe_allow_html=True)
-
-            with s4:
-                st.markdown(f"""<div class="mini-card"><div class="mini-title">CV Section Score</div><div class="mini-value">{section}%</div></div>""", unsafe_allow_html=True)
-
-            st.markdown("### Interpretation")
-
-            if final_score >= 80:
+            if final >= 80:
                 st.success("Strong match. Your CV seems well aligned with this job.")
-            elif final_score >= 60:
+            elif final >= 60:
                 st.info("Moderate match. Your CV is relevant, but could be tailored better.")
             else:
-                st.warning("Weak to moderate match. Consider tailoring your CV more strongly to this job.")
+                st.warning("Weak to moderate match. Consider tailoring your CV more strongly.")
 
-            col_a, col_b = st.columns(2)
+            r1, r2 = st.columns(2)
 
-            with col_a:
+            with r1:
                 st.markdown("### Matched Keywords")
-                if matched_keywords:
-                    st.write(", ".join(matched_keywords))
-                else:
-                    st.info("No strong keyword overlap detected.")
+                st.write(", ".join(matched) if matched else "No strong keyword overlap detected.")
 
                 st.markdown("### Found CV Sections")
-                if found_sections:
-                    st.write(", ".join(found_sections))
-                else:
-                    st.info("No common CV sections detected.")
+                st.write(", ".join(found_sections) if found_sections else "No common CV sections detected.")
 
-            with col_b:
+            with r2:
                 st.markdown("### Missing Keywords")
-                if missing_keywords:
-                    st.write(", ".join(missing_keywords))
-                else:
-                    st.success("No major missing keywords detected from the current skill list.")
+                st.write(", ".join(missing) if missing else "No major missing keywords detected.")
 
                 st.markdown("### Missing CV Sections")
-                if missing_sections:
-                    st.write(", ".join(missing_sections))
-                else:
-                    st.success("All basic CV sections were detected.")
-
-            st.markdown("### Suggested Improvements")
-            suggestions = generate_cv_suggestions(missing_keywords, missing_sections, final_score)
-
-            for suggestion in suggestions:
-                st.markdown(f"- {suggestion}")
+                st.write(", ".join(missing_sections) if missing_sections else "All basic CV sections were detected.")
 
             with st.expander("Extracted CV Text Preview"):
                 st.text(cv_text[:4000])
 
 
-# =========================================================
-# CALENDAR PAGE
-# =========================================================
-def render_calendar():
-    st.markdown("<h1>Calendar</h1>", unsafe_allow_html=True)
-    st.caption("A simple calendar-style view for interviews, follow-ups, and next steps.")
-
-    data = df.copy().sort_values("Date Applied", ascending=True)
-
-    event_keywords = "interview|follow|onsite|assignment|call|screen|recruiter|await|response|vorstellungsgespräch|telefon|aufgabe|rückmeldung"
-    events = data[
-        data["Next Step"].fillna("").str.lower().str.contains(event_keywords, regex=True)
-        | data["Status"].isin(["Interview", "Phone Screen", "Screening"])
-    ].copy()
-
-    if events.empty:
-        st.info("No calendar-related events found yet.")
-        return
-
-    events["Date Applied"] = events["Date Applied"].dt.strftime("%Y-%m-%d")
-
-    st.markdown("## Upcoming / Action Items")
-    st.dataframe(
-        events[["Date Applied", "Company", "Role", "Status", "Next Step", "Location"]],
-        use_container_width=True,
-        hide_index=True,
-        height=380,
-    )
-
-    st.markdown("## Timeline by Date")
-
-    grouped = events.groupby("Date Applied")
-
-    for event_date, group in grouped:
-        st.markdown(f"### 📅 {event_date}")
-        for _, row in group.iterrows():
-            st.markdown(
-                f"""
-                <div class="card">
-                    <b>{row['Company']}</b> — {row['Role']}<br>
-                    <span class="small-muted">Status: {row['Status']} | Location: {row['Location']}</span><br>
-                    <span>{row['Next Step']}</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
-
-
-# =========================================================
-# COMPANIES PAGE
-# =========================================================
-def render_companies():
-    st.markdown("<h1>Companies</h1>", unsafe_allow_html=True)
-    st.caption("Company-level overview based on your applications.")
-
-    if df.empty:
-        st.info("No companies yet.")
-        return
-
-    company_summary = (
-        df.groupby("Company")
-        .agg(
-            Applications=("Company", "count"),
-            Latest_Date=("Date Applied", "max"),
-            Roles=("Role", lambda x: ", ".join(sorted(set(x.astype(str))))),
-            Statuses=("Status", lambda x: ", ".join(sorted(set(x.astype(str))))),
-            Sources=("Source", lambda x: ", ".join(sorted(set(x.astype(str))))),
-            Locations=("Location", lambda x: ", ".join(sorted(set(x.astype(str))))),
-        )
-        .reset_index()
-        .sort_values("Applications", ascending=False)
-    )
-
-    company_summary["Latest_Date"] = company_summary["Latest_Date"].dt.strftime("%Y-%m-%d")
-
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        st.markdown(f"""<div class="mini-card"><div class="mini-title">Unique Companies</div><div class="mini-value">{df['Company'].nunique()}</div></div>""", unsafe_allow_html=True)
-
-    with c2:
-        top_company = company_summary.iloc[0]["Company"]
-        st.markdown(f"""<div class="mini-card"><div class="mini-title">Most Repeated Company</div><div class="mini-value">{top_company}</div></div>""", unsafe_allow_html=True)
-
-    with c3:
-        offer_companies = df[df["Status"] == "Offer"]["Company"].nunique()
-        st.markdown(f"""<div class="mini-card"><div class="mini-title">Companies with Offers</div><div class="mini-value">{offer_companies}</div></div>""", unsafe_allow_html=True)
-
-    st.markdown("## Company Details")
-    st.dataframe(company_summary, use_container_width=True, hide_index=True, height=420)
-
-    st.markdown("## Applications by Company")
-
-    company_counts = df["Company"].value_counts().reset_index()
-    company_counts.columns = ["Company", "Applications"]
-
-    fig = px.bar(company_counts, x="Company", y="Applications", text="Applications")
-    fig.update_layout(
-        height=360,
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        margin=dict(l=10, r=10, t=30, b=10),
-        showlegend=False,
-    )
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-
-# =========================================================
-# ANALYTICS PAGE
-# =========================================================
-def render_analytics():
+def analytics_page():
     st.markdown("<h1>Analytics</h1>", unsafe_allow_html=True)
-    st.caption("Deeper analytics for your job search performance.")
 
-    if df.empty:
+    if apps.empty:
         st.info("No data available.")
         return
 
-    metrics = calculate_metrics(df)
+    m = calculate_metrics(apps)
 
-    a1, a2, a3, a4 = st.columns(4)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Applications", m["total"])
+    c2.metric("Unique Companies", apps["Company"].nunique())
+    c3.metric("Sources Used", apps["Source"].nunique())
+    c4.metric("Active Applications", m["active"])
 
-    with a1:
-        st.markdown(f"""<div class="mini-card"><div class="mini-title">Total Applications</div><div class="mini-value">{metrics["total"]}</div></div>""", unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
 
-    with a2:
-        st.markdown(f"""<div class="mini-card"><div class="mini-title">Unique Companies</div><div class="mini-value">{df["Company"].nunique()}</div></div>""", unsafe_allow_html=True)
+    g1, g2 = st.columns(2)
 
-    with a3:
-        st.markdown(f"""<div class="mini-card"><div class="mini-title">Sources Used</div><div class="mini-value">{df["Source"].nunique()}</div></div>""", unsafe_allow_html=True)
-
-    with a4:
-        st.markdown(f"""<div class="mini-card"><div class="mini-title">Active Applications</div><div class="mini-value">{metrics["active"]}</div></div>""", unsafe_allow_html=True)
-
-    st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Status Distribution</div>', unsafe_allow_html=True)
-
-        status_counts = df["Status"].value_counts().reindex(STATUS_OPTIONS, fill_value=0).reset_index()
+    with g1:
+        status_counts = apps["Status"].value_counts().reindex(STATUS_OPTIONS, fill_value=0).reset_index()
         status_counts.columns = ["Status", "Applications"]
 
-        fig_status = px.bar(
+        fig = px.bar(
             status_counts,
             x="Status",
             y="Applications",
@@ -1975,228 +1886,188 @@ def render_analytics():
             color="Status",
             color_discrete_map=STATUS_COLORS,
         )
-        fig_status.update_layout(
+
+        fig.update_layout(
             height=360,
+            showlegend=False,
+            margin=dict(l=10, r=10, t=20, b=10),
             plot_bgcolor="white",
             paper_bgcolor="white",
-            margin=dict(l=10, r=10, t=20, b=10),
-            showlegend=False,
         )
-        st.plotly_chart(fig_status, use_container_width=True, config={"displayModeBar": False})
-        st.markdown("</div>", unsafe_allow_html=True)
 
-    with col2:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Source Performance</div>', unsafe_allow_html=True)
+        st.plotly_chart(fig, config={"displayModeBar": False}, **stretch())
 
-        source_status = pd.crosstab(df["Source"], df["Status"]).reset_index()
-        st.dataframe(source_status, use_container_width=True, hide_index=True, height=360)
-        st.markdown("</div>", unsafe_allow_html=True)
+    with g2:
+        source_status = pd.crosstab(apps["Source"], apps["Status"]).reset_index()
+        st.dataframe(source_status, hide_index=True, height=360, **stretch())
 
-    st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
+    monthly = apps.groupby(apps["Date Applied"].dt.to_period("M")).size().reset_index(name="Applications")
 
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Applications Over Time</div>', unsafe_allow_html=True)
+    if not monthly.empty:
+        monthly["Month"] = monthly["Date Applied"].dt.strftime("%b %Y")
 
-    monthly = df.groupby(df["Date Applied"].dt.to_period("M")).size().reset_index(name="Applications")
-    monthly["Month"] = monthly["Date Applied"].dt.strftime("%b %Y")
+        fig = px.line(monthly, x="Month", y="Applications", markers=True)
 
-    fig_line = px.line(monthly, x="Month", y="Applications", markers=True)
-    fig_line.update_layout(
-        height=350,
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        margin=dict(l=10, r=10, t=20, b=10),
-    )
-    st.plotly_chart(fig_line, use_container_width=True, config={"displayModeBar": False})
-    st.markdown("</div>", unsafe_allow_html=True)
+        fig.update_layout(
+            height=350,
+            margin=dict(l=10, r=10, t=20, b=10),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+
+        st.plotly_chart(fig, config={"displayModeBar": False}, **stretch())
 
 
-# =========================================================
-# INSIGHTS PAGE
-# =========================================================
-def render_insights():
+def insights_page():
     st.markdown("<h1>Insights</h1>", unsafe_allow_html=True)
-    st.caption("Full insights from your current job search data.")
 
-    if df.empty:
+    if apps.empty:
         st.info("No data available.")
         return
 
-    metrics = calculate_metrics(df)
+    m = calculate_metrics(apps)
 
-    i1, i2, i3, i4, i5 = st.columns(5)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total", m["total"])
+    c2.metric("Response Rate", f"{m['response_rate']}%")
+    c3.metric("Offer Rate", f"{m['offer_rate']}%")
+    c4.metric("Active", m["active"])
+    c5.metric("Docs", len(docs))
 
-    with i1:
-        st.markdown(f"""<div class="mini-card"><div class="mini-title">Total Applications</div><div class="mini-value">{metrics["total"]}</div></div>""", unsafe_allow_html=True)
+    st.markdown("## Actionable Applications")
 
-    with i2:
-        st.markdown(f"""<div class="mini-card"><div class="mini-title">Response Rate</div><div class="mini-value">{metrics["response_rate"]}%</div></div>""", unsafe_allow_html=True)
-
-    with i3:
-        st.markdown(f"""<div class="mini-card"><div class="mini-title">Offer Rate</div><div class="mini-value">{metrics["offer_rate"]}%</div></div>""", unsafe_allow_html=True)
-
-    with i4:
-        st.markdown(f"""<div class="mini-card"><div class="mini-title">Rejection Rate</div><div class="mini-value">{metrics["rejection_rate"]}%</div></div>""", unsafe_allow_html=True)
-
-    with i5:
-        st.markdown(f"""<div class="mini-card"><div class="mini-title">Active</div><div class="mini-value">{metrics["active"]}</div></div>""", unsafe_allow_html=True)
-
-    st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Best Sources</div>', unsafe_allow_html=True)
-
-        source_counts = df["Source"].value_counts().reset_index()
-        source_counts.columns = ["Source", "Applications"]
-
-        fig = px.bar(source_counts, x="Source", y="Applications", text="Applications")
-        fig.update_layout(
-            height=360,
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            margin=dict(l=10, r=10, t=20, b=10),
-            showlegend=False,
-        )
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with col2:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Status Summary</div>', unsafe_allow_html=True)
-
-        status_counts = df["Status"].value_counts().reindex(STATUS_OPTIONS, fill_value=0).reset_index()
-        status_counts.columns = ["Status", "Applications"]
-
-        fig = px.pie(
-            status_counts,
-            names="Status",
-            values="Applications",
-            hole=0.55,
-            color="Status",
-            color_discrete_map=STATUS_COLORS,
-        )
-        fig.update_layout(
-            height=360,
-            paper_bgcolor="white",
-            margin=dict(l=10, r=10, t=20, b=10),
-        )
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Actionable Applications</div>', unsafe_allow_html=True)
-
-    actionable = df[
-        df["Next Step"]
+    actionable = apps[
+        apps["Next Step"]
         .fillna("")
         .str.lower()
-        .str.contains("follow|await|response|recruiter|interview|assignment|call|onsite|rückmeldung|telefon", regex=True)
+        .str.contains(
+            "follow|await|response|recruiter|interview|assignment|call|onsite|availability|prepare|archive",
+            regex=True,
+        )
     ].copy()
 
     if actionable.empty:
         st.info("No actionable applications found.")
     else:
         actionable["Date Applied"] = actionable["Date Applied"].dt.strftime("%Y-%m-%d")
-        st.dataframe(actionable[DEFAULT_COLUMNS], use_container_width=True, hide_index=True, height=320)
+        st.dataframe(actionable[APP_COLUMNS], hide_index=True, height=320, **stretch())
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("## Linked Documents Overview")
+
+    linked = docs[docs["Linked Application"].astype(str).str.strip() != ""].copy()
+
+    if linked.empty:
+        st.info("No linked documents yet.")
+    else:
+        summary = linked["Linked Application"].value_counts().reset_index()
+        summary.columns = ["Linked Application", "Documents"]
+        st.dataframe(summary, hide_index=True, height=260, **stretch())
 
 
-# =========================================================
-# NOTES PAGE
-# =========================================================
-def render_notes():
+def notes_page():
     st.markdown("<h1>Notes</h1>", unsafe_allow_html=True)
-    st.caption("Keep notes about companies, interviews, follow-ups, and application strategy.")
 
     with st.expander("➕ Add Note", expanded=True):
-        with st.form("add_note_form", clear_on_submit=True):
-            n1, n2, n3 = st.columns(3)
+        with st.form("note_form", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
 
-            with n1:
-                title = st.text_input("Title", placeholder="Follow-up idea")
+            with c1:
+                title = st.text_input("Title", key="note_title")
 
-            with n2:
-                company = st.text_input("Company", placeholder="Infineon")
+            with c2:
+                company = st.text_input("Company", key="note_company")
 
-            with n3:
-                date_added = st.date_input("Date Added", value=date.today())
+            with c3:
+                added_date = st.date_input("Date Added", value=date.today(), key="note_date")
 
-            note = st.text_area("Note", placeholder="Write your note here...")
+            note_text = st.text_area("Note", key="note_text_area")
 
-            submitted = st.form_submit_button("Add Note", use_container_width=True)
-
-            if submitted:
-                if not title.strip() or not note.strip():
-                    st.error("Please enter at least a title and note.")
+            if st.form_submit_button("Add Note", **stretch()):
+                if not title.strip() or not note_text.strip():
+                    st.error("Please enter at least title and note.")
                 else:
+                    current = load_notes()
+
                     new_note = pd.DataFrame(
-                        [[title.strip(), company.strip(), date_added.strftime("%Y-%m-%d"), note.strip()]],
-                        columns=NOTES_COLUMNS,
+                        [[
+                            title.strip(),
+                            company.strip(),
+                            added_date.strftime("%Y-%m-%d"),
+                            note_text.strip(),
+                        ]],
+                        columns=NOTE_COLUMNS,
                     )
 
-                    updated_notes = pd.concat([notes_df[NOTES_COLUMNS], new_note], ignore_index=True)
-                    save_notes(updated_notes)
+                    save_notes(pd.concat([current[NOTE_COLUMNS], new_note], ignore_index=True))
                     st.success("Note added.")
                     st.rerun()
 
     st.markdown("## Notes List")
 
-    notes = load_notes()
-
     if notes.empty:
         st.info("No notes added yet.")
     else:
-        display_notes = notes.copy()
-        display_notes["Date Added"] = display_notes["Date Added"].dt.strftime("%Y-%m-%d")
-        st.dataframe(display_notes, use_container_width=True, hide_index=True, height=360)
+        display = notes.copy()
+        display["Date Added"] = display["Date Added"].dt.strftime("%Y-%m-%d")
 
-        st.markdown("## Delete Note")
-        delete_options = []
+        st.dataframe(display, hide_index=True, height=340, **stretch())
+
+        options = []
 
         for idx, row in notes.iterrows():
             date_text = row["Date Added"].strftime("%Y-%m-%d") if pd.notna(row["Date Added"]) else "No date"
-            delete_options.append(f"{idx} | {row['Title']} | {row['Company']} | {date_text}")
+            options.append(f"{idx} | {row['Title']} | {row['Company']} | {date_text}")
 
-        selected_note = st.selectbox("Select note", delete_options)
+        selected = st.selectbox("Select note to delete", options, key="selected_note_delete")
+        selected_idx = int(selected.split("|")[0].strip())
 
-        if st.button("Delete Note", use_container_width=True):
-            selected_index = int(selected_note.split("|")[0].strip())
-            notes = notes.drop(index=selected_index).reset_index(drop=True)
-            save_notes(notes)
-            st.success("Note deleted.")
+        if st.button("Delete Note", key="delete_note_btn", **stretch()):
+            st.session_state.confirm_delete_note = selected_idx
             st.rerun()
+
+        if st.session_state.confirm_delete_note == selected_idx:
+            st.warning(f"Are you sure you want to delete this note: {notes.loc[selected_idx, 'Title']}?")
+
+            c1, c2 = st.columns(2)
+
+            with c1:
+                if st.button("Yes, delete note", key="confirm_delete_note_yes", **stretch()):
+                    current = load_notes().drop(index=selected_idx).reset_index(drop=True)
+                    save_notes(current)
+
+                    st.session_state.confirm_delete_note = None
+                    st.success("Note deleted.")
+                    st.rerun()
+
+            with c2:
+                if st.button("Cancel", key="confirm_delete_note_cancel", **stretch()):
+                    st.session_state.confirm_delete_note = None
+                    st.rerun()
 
 
 # =========================================================
 # ROUTER
 # =========================================================
 if st.session_state.page == "Dashboard":
-    render_dashboard()
+    dashboard_page()
 
 elif st.session_state.page == "Applications":
-    render_applications()
+    applications_page()
 
 elif st.session_state.page == "Calendar":
-    render_calendar()
+    calendar_page()
 
 elif st.session_state.page == "Companies":
-    render_companies()
+    companies_page()
 
 elif st.session_state.page == "Documents":
-    render_documents()
+    documents_page()
 
 elif st.session_state.page == "Analytics":
-    render_analytics()
+    analytics_page()
 
 elif st.session_state.page == "Insights":
-    render_insights()
+    insights_page()
 
 elif st.session_state.page == "Notes":
-    render_notes()
+    notes_page()
